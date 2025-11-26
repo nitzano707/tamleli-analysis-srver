@@ -131,15 +131,17 @@ async def call_claude(prompt: str, api_key: str) -> str:
 async def call_gemini_pro(prompt: str, api_key: str) -> str:
     url = (
         "https://generativelanguage.googleapis.com/"
-        "v1beta/models/gemini-pro:generateContent"
+        "v1beta/models/gemini-1.5-pro:generateContent"
         f"?key={api_key}"
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     async with httpx.AsyncClient(timeout=200) as client:
         r = await client.post(url, json=payload)
+
     r.raise_for_status()
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
 
 
 async def model_call(prompt: str, model: str, api_key: Optional[str]) -> str:
