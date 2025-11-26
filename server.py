@@ -7,23 +7,16 @@ from pydantic import BaseModel
 import httpx
 
 
-# ============================================================
-# FASTAPI + CORS
-# ============================================================
-app = FastAPI(title="Braun & Clarke Qualitative Agent")
+app = FastAPI(title="Braun & Clarke Agent – GPT-5.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # בפרודקשן תעדכן!
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ============================================================
-# JOB STORE (In-Memory)
-# ============================================================
 JOBS = {}
 
 
@@ -36,16 +29,16 @@ def create_job(job_id):
     }
 
 
-def update_progress(job_id, val):
+def update_progress(job_id, v):
     if job_id in JOBS:
-        JOBS[job_id]["progress"] = int(val)
+        JOBS[job_id]["progress"] = int(v)
 
 
-def set_result(job_id, result):
+def set_result(job_id, r):
     if job_id in JOBS:
         JOBS[job_id]["status"] = "done"
         JOBS[job_id]["progress"] = 100
-        JOBS[job_id]["result"] = result
+        JOBS[job_id]["result"] = r
 
 
 def set_error(job_id, err):
@@ -54,84 +47,79 @@ def set_error(job_id, err):
         JOBS[job_id]["error"] = str(err)
 
 
-# ============================================================
-# REQUEST MODEL
-# ============================================================
 class AnalysisRequest(BaseModel):
-    transcript: list
+    transcript: dict | list
     research_context: dict = {}
     model: str = "gpt"
     api_key: str | None = None
 
 
 # ============================================================
-# PROVIDERS
+# 🔵 פונקציה שמנקה את התמלול ובוחרת את הגרסה העדכנית
 # ============================================================
-async def call_gpt(prompt, api_key):
+def extract_latest_version(raw):
+    if isinstance(raw, dict):
+        if "versions" in raw:             # תמלול עם כמה גרסאות
+            latest = raw["versions"][-1]
+            return latest.get("segments", [])
+        if "segments" in raw:
+            return raw["segments"]
+    return raw  # אם זה כבר list תקין
+
+
+# ============================================================
+# 🔵 מודל GPT-5.1 החדש
+# ============================================================
+async def call_gpt_51(prompt, api_key):
+    url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {api_key}"}
     body = {
-        "model": "gpt-4.1",
-        "messages": [{"role": "user", "content": prompt}]
+        "model": "gpt-5.1",
+        "input": prompt
     }
     async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post("https://api.openai.com/v1/chat/completions",
-                              headers=headers, json=body)
+        r = await client.post(url, headers=headers, json=body)
     data = r.json()
-    return data["choices"][0]["message"]["content"]
+    return data["output_text"]
 
 
 async def model_call(prompt, model, api_key):
-    return await call_gpt(prompt, api_key)
+    return await call_gpt_51(prompt, api_key)
 
 
 # ============================================================
-# PROMPTS — Braun & Clarke (6 Phases)
+# 🔵 PROMPTS – Braun & Clarke
 # ============================================================
 
-def p_clean_transcript(transcript):
+def p_initial_codes(text, ctx):
     return f"""
-נקה ותאם את התמלול הבא. אם קיימות מספר גרסאות, בחר בגרסה החדשה ביותר.
-עליך להחזיר מערך JSON של מקטעים בצורה:
-[{{"id":1,"text":"...","speaker":"...","start":0.0,"end":3.2}}, ...]
+בצע קידוד ראשוני ברמת Braun & Clarke.
+עבור כל משפט החזר JSON:
+{{"sentence":"...", "code":"..."}}
 
-תמלול:
-{json.dumps(transcript, ensure_ascii=False)}
-"""
-
-
-def p_initial_codes(segment, context):
-    return f"""
-בצע קידוד פתוח (Initial Coding) לפי Braun & Clarke על המקטע הבא.
-אסור לדלג על משפטים. עבור כל משפט החזר:
-{{
- "sentence": "...",
- "code": "..."
-}}
-
-הקשר מחקרי:
-{json.dumps(context, ensure_ascii=False, indent=2)}
+הקשר:
+{json.dumps(ctx, ensure_ascii=False, indent=2)}
 
 טקסט:
-{segment}
+{text}
 """
 
 
 def p_generate_themes(codes):
     return f"""
-צור תימות ראשוניות (Initial Themes) בהתאם לקודים הבאים:
+צור תימות ראשוניות מתוך הקודים הבאים:
+
 {json.dumps(codes, ensure_ascii=False)}
 
-החזר JSON מבנה:
-[
- {{"theme":"...", "codes":["..."]}}
-]
+החזר JSON:
+[{{"theme":"...", "codes":["..."]}}]
 """
 
 
 def p_review_themes(themes, transcript):
     return f"""
-בצע סקירה (Reviewing Themes).
-ודא שכל תימה נתמכת בציטוטים מדויקים מהתמלול.
+סקירת תימות:
+צרף ציטוטים מדויקים מהתמלול עם start,end,speaker.
 
 Themes:
 {json.dumps(themes, ensure_ascii=False)}
@@ -139,151 +127,114 @@ Themes:
 Transcript:
 {json.dumps(transcript, ensure_ascii=False)}
 
-החזר JSON מבנה:
-[
- {{
-   "theme":"...",
-   "codes":[...],
-   "quotes":[{{"text":"...","start":0.0,"end":3.1,"speaker":"..."}}]
- }}
-]
+החזר JSON.
 """
 
 
 def p_define_themes(reviewed):
     return f"""
-בצע הגדרה ומתן שם (Defining & Naming Themes) לכל תימה.
-
-להחזיר:
-[
- {{
-   "theme":"...",
-   "definition":"...",
-   "codes":[...],
-   "quotes":[...]
- }}
-]
+הגדרה ושיום תימות:
+החזר JSON עם:
+theme, definition, codes, quotes
 """
 
 
 def p_report(final):
     return f"""
-כתוב דו"ח מחקרי לפי Braun & Clarke על בסיס התימות הבאות:
-{json.dumps(final, ensure_ascii=False)}
-
-החזר JSON:
+כתוב דו״ח מחקרי סופי לפי Braun & Clarke.
+החזר:
 {{
  "summary":"...",
  "implications":"...",
- "themes": [...]
+ "themes":[...]
 }}
 """
 
 
 def p_matrix(final):
     return f"""
-בנה מטריצה מסכמת הכוללת:
-- תימה
-- הגדרה
-- קודים
-- ציטוטים
-- פרשנות
+בנה מטריצה:
+theme, definition, codes, quotes, interpretation
 
 Data:
 {json.dumps(final, ensure_ascii=False)}
 
-החזר JSON:
-[
- {{
-   "theme":"...",
-   "definition":"...",
-   "codes":["..."],
-   "quotes":[...],
-   "interpretation":"..."
- }}
-]
+החזר JSON.
 """
 
 
 # ============================================================
-# PIPELINE (6 PHASES)
+# 🔵 PIPELINE
 # ============================================================
-async def run_pipeline(job_id, transcript_raw, context, model, api_key):
+async def run_pipeline(job_id, transcript_raw, ctx, model, api_key):
 
-    # ------------------ 1. Familiarization ------------------
+    # 1) extract latest version
     update_progress(job_id, 5)
-    clean_raw = await model_call(p_clean_transcript(transcript_raw), model, api_key)
-    transcript = json.loads(clean_raw)
+    transcript = extract_latest_version(transcript_raw)
 
-    # ------------------ 2. Initial Coding -------------------
+    # 2) initial coding
     all_codes = []
     total = len(transcript)
+
     for i, seg in enumerate(transcript, start=1):
-        c_raw = await model_call(p_initial_codes(seg["text"], context), model, api_key)
+        text = seg.get("text", "")
+        c_raw = await model_call(p_initial_codes(text, ctx), model, api_key)
         codes = json.loads(c_raw)
-        all_codes.append({
-            "segment_id": seg["id"],
-            "codes": codes
-        })
-        update_progress(job_id, 5 + (i / total) * 30)
+        all_codes.append({"segment": seg, "codes": codes})
 
-    # ------------------ 3. Generate Themes ------------------
-    update_progress(job_id, 40)
+        update_progress(job_id, 5 + (i / total) * 25)
+
+    # 3) generate themes
+    update_progress(job_id, 35)
     th_raw = await model_call(p_generate_themes(all_codes), model, api_key)
-    initial_themes = json.loads(th_raw)
+    themes_initial = json.loads(th_raw)
 
-    # ------------------ 4. Review Themes --------------------
-    update_progress(job_id, 55)
-    rv_raw = await model_call(p_review_themes(initial_themes, transcript), model, api_key)
-    reviewed = json.loads(rv_raw)
+    # 4) review themes
+    update_progress(job_id, 50)
+    rv_raw = await model_call(p_review_themes(themes_initial, transcript), model, api_key)
+    themes_reviewed = json.loads(rv_raw)
 
-    # ------------------ 5. Define & Name Themes -------------
+    # 5) define
     update_progress(job_id, 70)
-    df_raw = await model_call(p_define_themes(reviewed), model, api_key)
-    defined = json.loads(df_raw)
+    df_raw = await model_call(p_define_themes(themes_reviewed), model, api_key)
+    themes_defined = json.loads(df_raw)
 
-    # ------------------ 6. Final Report ---------------------
+    # 6) report
     update_progress(job_id, 85)
-    rpt_raw = await model_call(p_report(defined), model, api_key)
+    rpt_raw = await model_call(p_report(themes_defined), model, api_key)
     report = json.loads(rpt_raw)
 
-    # ------------------ MATRIX ------------------------------
+    # matrix
     update_progress(job_id, 95)
-    mx_raw = await model_call(p_matrix(defined), model, api_key)
+    mx_raw = await model_call(p_matrix(themes_defined), model, api_key)
     matrix = json.loads(mx_raw)
 
     return {
         "clean_transcript": transcript,
         "codes": all_codes,
-        "themes_initial": initial_themes,
-        "themes_reviewed": reviewed,
-        "themes_defined": defined,
+        "themes_initial": themes_initial,
+        "themes_reviewed": themes_reviewed,
+        "themes_defined": themes_defined,
         "report": report,
         "matrix": matrix
     }
 
 
-# ============================================================
-# BACKGROUND TASK WRAPPER
-# ============================================================
-async def background_task(job_id, transcript, ctx, model, api_key):
+async def background(job_id, transcript, ctx, m, key):
     try:
-        result = await run_pipeline(job_id, transcript, ctx, model, api_key)
-        set_result(job_id, result)
+        r = await run_pipeline(job_id, transcript, ctx, m, key)
+        set_result(job_id, r)
     except Exception as e:
         set_error(job_id, e)
 
 
-# ============================================================
-# API ENDPOINTS
-# ============================================================
 @app.post("/agent/analyze")
 async def analyze(req: AnalysisRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
     background_tasks.add_task(
-        background_task,
+        background,
         job_id,
         req.transcript,
         req.research_context,
@@ -295,9 +246,7 @@ async def analyze(req: AnalysisRequest, background_tasks: BackgroundTasks):
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    if job_id not in JOBS:
-        return {"error": "not found"}
-    return JOBS[job_id]
+    return JOBS.get(job_id, {"error": "not found"})
 
 
 @app.get("/ping")
@@ -305,9 +254,6 @@ async def ping():
     return {"status": "ok"}
 
 
-# ============================================================
-# LOCAL
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000)
