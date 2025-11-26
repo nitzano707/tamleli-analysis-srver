@@ -98,7 +98,7 @@ def extract_json(raw_text: str):
 async def call_gpt(prompt: str, api_key: str) -> str:
     headers = {"Authorization": f"Bearer {api_key}"}
     body = {
-        "model": "gpt-5.1",
+        "model": "gpt-4o",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
     }
@@ -624,3 +624,4 @@ async def ping():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000)
+    
