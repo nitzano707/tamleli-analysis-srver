@@ -1,35 +1,33 @@
 import uuid
 import json
 import asyncio
-from typing import Union, Optional
-
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
-import re
 
 
-# ─────────────────────────────────────────────
+# ============================================================
 # FASTAPI + CORS
-# ─────────────────────────────────────────────
-app = FastAPI(title="Qualitative Analysis Agent")
+# ============================================================
+app = FastAPI(title="Braun & Clarke Qualitative Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # בפרודקשן מומלץ להגביל
+    allow_origins=["*"],        # בפרודקשן תעדכן!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ─────────────────────────────────────────────
-# זיכרון עבודות (אפשר להחליף ל-Redis)
-# ─────────────────────────────────────────────
+# ============================================================
+# JOB STORE (In-Memory)
+# ============================================================
 JOBS = {}
 
-def create_job(job_id: str):
+
+def create_job(job_id):
     JOBS[job_id] = {
         "status": "running",
         "progress": 0,
@@ -37,316 +35,269 @@ def create_job(job_id: str):
         "error": None
     }
 
-def update_progress(job_id: str, p: int):
-    if job_id in JOBS:
-        JOBS[job_id]["progress"] = p
 
-def set_result(job_id: str, r: dict):
+def update_progress(job_id, val):
+    if job_id in JOBS:
+        JOBS[job_id]["progress"] = int(val)
+
+
+def set_result(job_id, result):
     if job_id in JOBS:
         JOBS[job_id]["status"] = "done"
-        JOBS[job_id]["result"] = r
         JOBS[job_id]["progress"] = 100
+        JOBS[job_id]["result"] = result
 
-def set_error(job_id: str, e: str):
+
+def set_error(job_id, err):
     if job_id in JOBS:
         JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = e
+        JOBS[job_id]["error"] = str(err)
 
 
-# ─────────────────────────────────────────────
-# מודל בקשה
-# ─────────────────────────────────────────────
+# ============================================================
+# REQUEST MODEL
+# ============================================================
 class AnalysisRequest(BaseModel):
-    transcript: Union[list, dict]
+    transcript: list
     research_context: dict = {}
     model: str = "gpt"
-    api_key: Optional[str] = None
+    api_key: str | None = None
 
 
-# ─────────────────────────────────────────────
-# JSON FIX – תקן JSON שבור
-# ─────────────────────────────────────────────
-def safe_json(text: str):
-    """מתקן JSON שבור שמודלים מחזירים לעיתים"""
-    if not text:
-        return None
-
-    # מחיקת ```json ``` 
-    cleaned = re.sub(r"```json", "", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"```", "", cleaned).strip()
-
-    # ניסיון ראשון
-    try:
-        return json.loads(cleaned)
-    except:
-        pass
-
-    # ניסיון שני — השלמת סוגריים
-    try:
-        cleaned2 = cleaned + "}" if cleaned.count("{") > cleaned.count("}") else cleaned
-        cleaned2 = cleaned2 + "]" if cleaned.count("[") > cleaned.count("]") else cleaned2
-        return json.loads(cleaned2)
-    except:
-        return None
-
-
-# ─────────────────────────────────────────────
-# NORMALIZE – המרת התמלול לפורמט אחיד
-# ─────────────────────────────────────────────
-def normalize_transcript(t):
-    if isinstance(t, list):
-        return t
-
-    if isinstance(t, dict):
-        if isinstance(t.get("segments"), list):
-            return t["segments"]
-        if isinstance(t.get("utterances"), list):
-            return t["utterances"]
-
-    raise Exception("פורמט תמלול לא מזוהה (נדרש segments[] או רשימה).")
-
-
-# ─────────────────────────────────────────────
-# OpenAI (GPT-4.1 / GPT-4.1-mini / GPT-5.1)
-# ─────────────────────────────────────────────
-async def call_gpt(prompt: str, api_key: str):
+# ============================================================
+# PROVIDERS
+# ============================================================
+async def call_gpt(prompt, api_key):
     headers = {"Authorization": f"Bearer {api_key}"}
-
     body = {
-        "model": "gpt-5.1",     # הדגם החדש ביותר
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "temperature": 0.1
+        "model": "gpt-4.1",
+        "messages": [{"role": "user", "content": prompt}]
     }
-
-    async with httpx.AsyncClient(timeout=200) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=body
-        )
-
-    if r.status_code >= 400:
-        raise Exception(f"OpenAI error: {r.text}")
-
-    return r.json()["choices"][0]["message"]["content"]
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post("https://api.openai.com/v1/chat/completions",
+                              headers=headers, json=body)
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
 
 
-# ─────────────────────────────────────────────
-# Unified model router
-# ─────────────────────────────────────────────
-async def model_call(prompt: str, model: str, api_key: str):
-    if model == "gpt":
-        return await call_gpt(prompt, api_key)
-    return await call_gpt(prompt, api_key)  # ברירת מחדל
+async def model_call(prompt, model, api_key):
+    return await call_gpt(prompt, api_key)
 
 
-# ─────────────────────────────────────────────
-# PROMPTS – גרסה קשיחה ל-GPT
-# ─────────────────────────────────────────────
-def P_OPEN(text, ctx):
+# ============================================================
+# PROMPTS — Braun & Clarke (6 Phases)
+# ============================================================
+
+def p_clean_transcript(transcript):
     return f"""
-אתה מנתח איכותני. עליך להחזיר JSON בלבד, ללא הסברים.
-אם אינך יכול להחזיר JSON תקני – החזר: {{"codes": []}}
+נקה ותאם את התמלול הבא. אם קיימות מספר גרסאות, בחר בגרסה החדשה ביותר.
+עליך להחזיר מערך JSON של מקטעים בצורה:
+[{{"id":1,"text":"...","speaker":"...","start":0.0,"end":3.2}}, ...]
 
-טקסט לניתוח:
-{text}
-
-הקשר מחקרי:
-{json.dumps(ctx, ensure_ascii=False)}
-
-החזר JSON בלבד בפורמט:
-{{
-  "codes": [
-    {{
-      "sentence": "…",
-      "code": "…"
-    }}
-  ]
-}}
-"""
-
-
-def P_AXIAL(open_codes, ctx):
-    return f"""
-אתה מנתח איכותני. בצע Axial Coding.
-
-החזר JSON בלבד בפורמט:
-{{ "axial": [...] }}
-
-קלט:
-קידוד פתוח:
-{json.dumps(open_codes, ensure_ascii=False)}
-הקשר:
-{json.dumps(ctx, ensure_ascii=False)}
-"""
-
-
-def P_THEMES(axial, ctx):
-    return f"""
-אתה מנתח איכותני. זהה Themes.
-
-החזר JSON בלבד:
-{{ "themes": [...] }}
-
-Axial:
-{json.dumps(axial, ensure_ascii=False)}
-"""
-
-
-def P_QUOTES(themes, transcript):
-    return f"""
-התאם ציטוט לכל קוד.
-
-החזר JSON בלבד:
-{{ "quotes": {{ ... }} }}
-
-Themes:
-{json.dumps(themes, ensure_ascii=False)}
-Transcript:
+תמלול:
 {json.dumps(transcript, ensure_ascii=False)}
 """
 
 
-def P_INTERPRET(themes, quotes):
+def p_initial_codes(segment, context):
     return f"""
-כתוב פרשנות עומק.
+בצע קידוד פתוח (Initial Coding) לפי Braun & Clarke על המקטע הבא.
+אסור לדלג על משפטים. עבור כל משפט החזר:
+{{
+ "sentence": "...",
+ "code": "..."
+}}
 
-החזר JSON בלבד:
-{{ "interpretations": {{ ... }} }}
+הקשר מחקרי:
+{json.dumps(context, ensure_ascii=False, indent=2)}
 
-Themes:
-{json.dumps(themes, ensure_ascii=False)}
-Quotes:
-{json.dumps(quotes, ensure_ascii=False)}
+טקסט:
+{segment}
 """
 
 
-def P_MATRIX(themes, quotes, interp):
+def p_generate_themes(codes):
     return f"""
-בנה מטריצה מסכמת.
+צור תימות ראשוניות (Initial Themes) בהתאם לקודים הבאים:
+{json.dumps(codes, ensure_ascii=False)}
 
-החזר JSON בלבד:
-{{ "matrix": [...] }}
-
-Themes:
-{json.dumps(themes, ensure_ascii=False)}
-Quotes:
-{json.dumps(quotes, ensure_ascii=False)}
-Interpretations:
-{json.dumps(interp, ensure_ascii=False)}
+החזר JSON מבנה:
+[
+ {{"theme":"...", "codes":["..."]}}
+]
 """
 
 
-# ─────────────────────────────────────────────
-# ENFORCE – אכיפה קשיחה לכל מקטע
-# ─────────────────────────────────────────────
-async def enforce_open_code(text, ctx, model, api_key):
-    for _ in range(3):
-        raw = await model_call(P_OPEN(text, ctx), model, api_key)
-        parsed = safe_json(raw)
-        if parsed and "codes" in parsed:
-            return parsed
+def p_review_themes(themes, transcript):
+    return f"""
+בצע סקירה (Reviewing Themes).
+ודא שכל תימה נתמכת בציטוטים מדויקים מהתמלול.
 
-    # fallback – לא מפיל את כל התהליך
-    return {"codes": []}
+Themes:
+{json.dumps(themes, ensure_ascii=False)}
+
+Transcript:
+{json.dumps(transcript, ensure_ascii=False)}
+
+החזר JSON מבנה:
+[
+ {{
+   "theme":"...",
+   "codes":[...],
+   "quotes":[{{"text":"...","start":0.0,"end":3.1,"speaker":"..."}}]
+ }}
+]
+"""
 
 
-# ─────────────────────────────────────────────
-# PIPELINE מלא
-# ─────────────────────────────────────────────
-async def pipeline(job_id, transcript, ctx, model, api_key):
+def p_define_themes(reviewed):
+    return f"""
+בצע הגדרה ומתן שם (Defining & Naming Themes) לכל תימה.
 
+להחזיר:
+[
+ {{
+   "theme":"...",
+   "definition":"...",
+   "codes":[...],
+   "quotes":[...]
+ }}
+]
+"""
+
+
+def p_report(final):
+    return f"""
+כתוב דו"ח מחקרי לפי Braun & Clarke על בסיס התימות הבאות:
+{json.dumps(final, ensure_ascii=False)}
+
+החזר JSON:
+{{
+ "summary":"...",
+ "implications":"...",
+ "themes": [...]
+}}
+"""
+
+
+def p_matrix(final):
+    return f"""
+בנה מטריצה מסכמת הכוללת:
+- תימה
+- הגדרה
+- קודים
+- ציטוטים
+- פרשנות
+
+Data:
+{json.dumps(final, ensure_ascii=False)}
+
+החזר JSON:
+[
+ {{
+   "theme":"...",
+   "definition":"...",
+   "codes":["..."],
+   "quotes":[...],
+   "interpretation":"..."
+ }}
+]
+"""
+
+
+# ============================================================
+# PIPELINE (6 PHASES)
+# ============================================================
+async def run_pipeline(job_id, transcript_raw, context, model, api_key):
+
+    # ------------------ 1. Familiarization ------------------
     update_progress(job_id, 5)
+    clean_raw = await model_call(p_clean_transcript(transcript_raw), model, api_key)
+    transcript = json.loads(clean_raw)
 
-    # 1) open coding
-    open_codes = []
+    # ------------------ 2. Initial Coding -------------------
+    all_codes = []
     total = len(transcript)
-
     for i, seg in enumerate(transcript, start=1):
-        text = seg.get("text") or seg.get("sentence") or ""
-        oc = await enforce_open_code(text, ctx, model, api_key)
-        open_codes.append({"id": seg.get("id", i), **oc})
+        c_raw = await model_call(p_initial_codes(seg["text"], context), model, api_key)
+        codes = json.loads(c_raw)
+        all_codes.append({
+            "segment_id": seg["id"],
+            "codes": codes
+        })
+        update_progress(job_id, 5 + (i / total) * 30)
 
-        update_progress(job_id, int(5 + (i / total) * 40))
+    # ------------------ 3. Generate Themes ------------------
+    update_progress(job_id, 40)
+    th_raw = await model_call(p_generate_themes(all_codes), model, api_key)
+    initial_themes = json.loads(th_raw)
 
-    # 2) Axial
+    # ------------------ 4. Review Themes --------------------
     update_progress(job_id, 55)
-    axial_raw = await model_call(P_AXIAL(open_codes, ctx), model, api_key)
-    axial = safe_json(axial_raw) or {"axial": []}
+    rv_raw = await model_call(p_review_themes(initial_themes, transcript), model, api_key)
+    reviewed = json.loads(rv_raw)
 
-    # 3) Themes
-    update_progress(job_id, 65)
-    t_raw = await model_call(P_THEMES(axial, ctx), model, api_key)
-    themes = safe_json(t_raw) or {"themes": []}
+    # ------------------ 5. Define & Name Themes -------------
+    update_progress(job_id, 70)
+    df_raw = await model_call(p_define_themes(reviewed), model, api_key)
+    defined = json.loads(df_raw)
 
-    # 4) Quotes
-    update_progress(job_id, 75)
-    q_raw = await model_call(P_QUOTES(themes, transcript), model, api_key)
-    quotes = safe_json(q_raw) or {"quotes": {}}
-
-    # 5) Interpretations
+    # ------------------ 6. Final Report ---------------------
     update_progress(job_id, 85)
-    i_raw = await model_call(P_INTERPRET(themes, quotes), model, api_key)
-    interp = safe_json(i_raw) or {"interpretations": {}}
+    rpt_raw = await model_call(p_report(defined), model, api_key)
+    report = json.loads(rpt_raw)
 
-    # 6) Matrix
+    # ------------------ MATRIX ------------------------------
     update_progress(job_id, 95)
-    m_raw = await model_call(P_MATRIX(themes, quotes, interp), model, api_key)
-    matrix = safe_json(m_raw) or {"matrix": []}
+    mx_raw = await model_call(p_matrix(defined), model, api_key)
+    matrix = json.loads(mx_raw)
 
     return {
-        "openCoding": open_codes,
-        "axial": axial,
-        "themes": themes,
-        "quotes": quotes,
-        "interpretations": interp,
+        "clean_transcript": transcript,
+        "codes": all_codes,
+        "themes_initial": initial_themes,
+        "themes_reviewed": reviewed,
+        "themes_defined": defined,
+        "report": report,
         "matrix": matrix
     }
 
 
-# ─────────────────────────────────────────────
-# BACKGROUND WORKER
-# ─────────────────────────────────────────────
-async def background(job_id, transcript_raw, ctx, model, api_key):
+# ============================================================
+# BACKGROUND TASK WRAPPER
+# ============================================================
+async def background_task(job_id, transcript, ctx, model, api_key):
     try:
-        transcript = normalize_transcript(transcript_raw)
-        result = await pipeline(job_id, transcript, ctx, model, api_key)
+        result = await run_pipeline(job_id, transcript, ctx, model, api_key)
         set_result(job_id, result)
     except Exception as e:
-        set_error(job_id, str(e))
+        set_error(job_id, e)
 
 
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
+# ============================================================
+# API ENDPOINTS
+# ============================================================
 @app.post("/agent/analyze")
-async def analyze(req: AnalysisRequest, tasks: BackgroundTasks):
-    if not req.api_key:
-        raise Exception("נדרש מפתח API חוקי של OpenAI.")
-
+async def analyze(req: AnalysisRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
-    tasks.add_task(
-        background,
+    background_tasks.add_task(
+        background_task,
         job_id,
         req.transcript,
         req.research_context,
         req.model,
-        req.api_key,
+        req.api_key
     )
-
     return {"job_id": job_id, "status": "processing"}
 
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    return JOBS.get(job_id, {"error": "job not found"})
+    if job_id not in JOBS:
+        return {"error": "not found"}
+    return JOBS[job_id]
 
 
 @app.get("/ping")
@@ -354,9 +305,9 @@ async def ping():
     return {"status": "ok"}
 
 
-# ─────────────────────────────────────────────
-# RUN LOCAL
-# ─────────────────────────────────────────────
+# ============================================================
+# LOCAL
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000)
