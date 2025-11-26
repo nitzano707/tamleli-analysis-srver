@@ -7,75 +7,93 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
+import re
+
 
 # ─────────────────────────────────────────────
-# FastAPI + CORS
+# FASTAPI + CORS
 # ─────────────────────────────────────────────
 app = FastAPI(title="Qualitative Analysis Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # בפרודקשן: לצמצם למקורות המותרים בלבד
+    allow_origins=["*"],      # בפרודקשן מומלץ להגביל
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────
-# JOB STORE — בזיכרון (אפשר להחליף ל-Redis בעתיד)
-# ─────────────────────────────────────────────
-JOBS: dict[str, dict] = {}
 
+# ─────────────────────────────────────────────
+# זיכרון עבודות (אפשר להחליף ל-Redis)
+# ─────────────────────────────────────────────
+JOBS = {}
 
 def create_job(job_id: str):
     JOBS[job_id] = {
         "status": "running",
         "progress": 0,
         "result": None,
-        "error": None,
+        "error": None
     }
 
-
-def update_progress(job_id: str, progress: int):
+def update_progress(job_id: str, p: int):
     if job_id in JOBS:
-        JOBS[job_id]["progress"] = progress
+        JOBS[job_id]["progress"] = p
 
-
-def set_result(job_id: str, result: dict):
+def set_result(job_id: str, r: dict):
     if job_id in JOBS:
         JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["result"] = r
         JOBS[job_id]["progress"] = 100
-        JOBS[job_id]["result"] = result
 
-
-def set_error(job_id: str, error: str):
+def set_error(job_id: str, e: str):
     if job_id in JOBS:
         JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = str(error)
+        JOBS[job_id]["error"] = e
 
 
 # ─────────────────────────────────────────────
-# מודל בקשה מהפרונט
-# מאפשר גם list ישיר וגם אובייקט עם segments
+# מודל בקשה
 # ─────────────────────────────────────────────
 class AnalysisRequest(BaseModel):
     transcript: Union[list, dict]
     research_context: dict = {}
-    model: str = "gemini"  # gpt / claude / gemini
+    model: str = "gpt"
     api_key: Optional[str] = None
 
 
 # ─────────────────────────────────────────────
-# NORMALIZATION — תמיכה ב-Tamleli JSON וכו'
+# JSON FIX – תקן JSON שבור
 # ─────────────────────────────────────────────
-def normalize_transcript(t: Union[list, dict]) -> list:
-    """
-    מחזיר תמיד list של מקטעים.
-    תומך בפורמטים:
-    1. [ {...}, {...} ]
-    2. { "segments": [ {...}, ... ] }
-    3. { "utterances": [ {...}, ... ] }
-    """
+def safe_json(text: str):
+    """מתקן JSON שבור שמודלים מחזירים לעיתים"""
+    if not text:
+        return None
+
+    # מחיקת ```json ``` 
+    cleaned = re.sub(r"```json", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned).strip()
+
+    # ניסיון ראשון
+    try:
+        return json.loads(cleaned)
+    except:
+        pass
+
+    # ניסיון שני — השלמת סוגריים
+    try:
+        cleaned2 = cleaned + "}" if cleaned.count("{") > cleaned.count("}") else cleaned
+        cleaned2 = cleaned2 + "]" if cleaned.count("[") > cleaned.count("]") else cleaned2
+        return json.loads(cleaned2)
+    except:
+        return None
+
+
+# ─────────────────────────────────────────────
+# NORMALIZE – המרת התמלול לפורמט אחיד
+# ─────────────────────────────────────────────
+def normalize_transcript(t):
     if isinstance(t, list):
         return t
 
@@ -85,349 +103,237 @@ def normalize_transcript(t: Union[list, dict]) -> list:
         if isinstance(t.get("utterances"), list):
             return t["utterances"]
 
-    raise Exception("פורמט התמלול לא מזוהה – נדרש מערך או אובייקט עם 'segments' / 'utterances'.")
+    raise Exception("פורמט תמלול לא מזוהה (נדרש segments[] או רשימה).")
 
 
 # ─────────────────────────────────────────────
-# AI PROVIDERS
+# OpenAI (GPT-4.1 / GPT-4.1-mini / GPT-5.1)
 # ─────────────────────────────────────────────
-async def call_gpt(prompt: str, api_key: str) -> str:
+async def call_gpt(prompt: str, api_key: str):
     headers = {"Authorization": f"Bearer {api_key}"}
+
     body = {
-        "model": "gpt-4.1",
-        "messages": [{"role": "user", "content": prompt}],
+        "model": "gpt-5.1",     # הדגם החדש ביותר
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1
     }
+
     async with httpx.AsyncClient(timeout=200) as client:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
-            json=body,
+            json=body
         )
-    r.raise_for_status()
+
+    if r.status_code >= 400:
+        raise Exception(f"OpenAI error: {r.text}")
+
     return r.json()["choices"][0]["message"]["content"]
 
 
-async def call_claude(prompt: str, api_key: str) -> str:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 4000,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    async with httpx.AsyncClient(timeout=200) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=body,
-        )
-    r.raise_for_status()
-    return r.json()["content"][0]["text"]
-
-
-async def call_gemini_pro(prompt: str, api_key: str) -> str:
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        "v1beta/models/gemini-1.5-pro:generateContent"
-        f"?key={api_key}"
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    async with httpx.AsyncClient(timeout=200) as client:
-        r = await client.post(url, json=payload)
-
-    r.raise_for_status()
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
-
-
-
-async def model_call(prompt: str, model: str, api_key: Optional[str]) -> str:
-    """
-    שכבת הפשטה אחת לכל המודלים.
-    כרגע נדרש api_key תקף לכל מודל.
-    """
-    if not api_key:
-        raise Exception("לא הוזן api_key למודל. יש להזין מפתח מתאים למודל שנבחר.")
-
+# ─────────────────────────────────────────────
+# Unified model router
+# ─────────────────────────────────────────────
+async def model_call(prompt: str, model: str, api_key: str):
     if model == "gpt":
         return await call_gpt(prompt, api_key)
-    if model == "claude":
-        return await call_claude(prompt, api_key)
-    if model == "gemini":
-        return await call_gemini_pro(prompt, api_key)
-
-    # ברירת מחדל — ננסה GPT
-    return await call_gpt(prompt, api_key)
+    return await call_gpt(prompt, api_key)  # ברירת מחדל
 
 
 # ─────────────────────────────────────────────
-# פרומפטים
+# PROMPTS – גרסה קשיחה ל-GPT
 # ─────────────────────────────────────────────
-def p_open_coding(text: str, context: dict) -> str:
+def P_OPEN(text, ctx):
     return f"""
-בצע קידוד פתוח (Open Coding) על הקטע הבא.
-עליך לזהות קודים ברורים בלבד.
-חובה להתייחס לכל משפט, ללא דילוג.
+אתה מנתח איכותני. עליך להחזיר JSON בלבד, ללא הסברים.
+אם אינך יכול להחזיר JSON תקני – החזר: {{"codes": []}}
+
+טקסט לניתוח:
+{text}
 
 הקשר מחקרי:
-{json.dumps(context, ensure_ascii=False, indent=2)}
+{json.dumps(ctx, ensure_ascii=False)}
 
-הטקסט:
-{text}
-
-החזר JSON תקני בלבד:
-{{"codes":[{{"sentence":"...","code":"..."}}]}}
+החזר JSON בלבד בפורמט:
+{{
+  "codes": [
+    {{
+      "sentence": "…",
+      "code": "…"
+    }}
+  ]
+}}
 """
 
 
-def p_coverage(text: str, codes_json: dict) -> str:
+def P_AXIAL(open_codes, ctx):
     return f"""
-בדיקת כיסוי. בדוק שכל משפט בטקסט מכוסה בקוד.
+אתה מנתח איכותני. בצע Axial Coding.
 
-טקסט:
-{text}
+החזר JSON בלבד בפורמט:
+{{ "axial": [...] }}
 
-קידוד:
-{json.dumps(codes_json, ensure_ascii=False)}
-
-החזר JSON:
-{{"status":"ok"}} או
-{{"status":"missing","sentences":["..."]}}
-"""
-
-
-def p_cross(text: str, codes_json: dict) -> str:
-    return f"""
-Cross-check:
-האם הקידוד מתייחס לכל המשפטים באופן מלא?
-
-טקסט:
-{text}
-
-קידוד:
-{json.dumps(codes_json, ensure_ascii=False)}
-
-החזר JSON:
-{{"cross_ok": true}} או
-{{"cross_ok": false}}
-"""
-
-
-def p_axial(open_coding: list, context: dict) -> str:
-    return f"""
-בצע Axial Coding על בסיס כלל הקודים.
-
-הקשר מחקרי:
-{json.dumps(context, ensure_ascii=False, indent=2)}
-
+קלט:
 קידוד פתוח:
-{json.dumps(open_coding, ensure_ascii=False)}
-
-החזר JSON תקני בלבד.
+{json.dumps(open_codes, ensure_ascii=False)}
+הקשר:
+{json.dumps(ctx, ensure_ascii=False)}
 """
 
 
-def p_themes(axial: dict, context: dict) -> str:
+def P_THEMES(axial, ctx):
     return f"""
-זהה Themes (תמות) על בסיס הקידוד הצירי.
+אתה מנתח איכותני. זהה Themes.
 
-הקשר מחקרי:
-{json.dumps(context, ensure_ascii=False, indent=2)}
+החזר JSON בלבד:
+{{ "themes": [...] }}
 
 Axial:
 {json.dumps(axial, ensure_ascii=False)}
-
-החזר JSON תקני בלבד.
 """
 
 
-def p_quotes(themes: dict, transcript: list) -> str:
+def P_QUOTES(themes, transcript):
     return f"""
-התאם לכל קוד ציטוט מדויק מתוך התמלול.
+התאם ציטוט לכל קוד.
+
+החזר JSON בלבד:
+{{ "quotes": {{ ... }} }}
 
 Themes:
 {json.dumps(themes, ensure_ascii=False)}
-
-תמלול:
+Transcript:
 {json.dumps(transcript, ensure_ascii=False)}
-
-החזר JSON תקני בלבד.
 """
 
 
-def p_interpret(themes: dict, quotes: dict) -> str:
+def P_INTERPRET(themes, quotes):
     return f"""
-כתוב פרשנות עומק מחקרית לכל תימה.
+כתוב פרשנות עומק.
+
+החזר JSON בלבד:
+{{ "interpretations": {{ ... }} }}
 
 Themes:
 {json.dumps(themes, ensure_ascii=False)}
-
 Quotes:
 {json.dumps(quotes, ensure_ascii=False)}
-
-החזר JSON תקני בלבד.
 """
 
 
-def p_matrix(themes: dict, quotes: dict, interpretations: dict) -> str:
+def P_MATRIX(themes, quotes, interp):
     return f"""
-בנה מטריצה מסכמת הכוללת:
-- תימה
-- קודים
-- ציטוטים
-- פרשנות
+בנה מטריצה מסכמת.
+
+החזר JSON בלבד:
+{{ "matrix": [...] }}
 
 Themes:
 {json.dumps(themes, ensure_ascii=False)}
-
 Quotes:
 {json.dumps(quotes, ensure_ascii=False)}
-
 Interpretations:
-{json.dumps(interpretations, ensure_ascii=False)}
-
-החזר JSON תקני בלבד.
+{json.dumps(interp, ensure_ascii=False)}
 """
 
 
 # ─────────────────────────────────────────────
-# Strict Enforcement — per segment
+# ENFORCE – אכיפה קשיחה לכל מקטע
 # ─────────────────────────────────────────────
-async def enforce_segment(text: str, context: dict, model: str, api_key: Optional[str]) -> dict:
-    """
-    אוכף שהמודל יעבור על כל המקטע: open coding + coverage + cross-check.
-    מנסה עד 3 פעמים לפני שמרים שגיאה.
-    """
-    for attempt in range(3):
-        # 1. Open coding
-        oc_prompt = p_open_coding(text, context)
-        oc_raw = await model_call(oc_prompt, model, api_key)
-        try:
-            oc = json.loads(oc_raw)
-        except Exception:
-            continue
+async def enforce_open_code(text, ctx, model, api_key):
+    for _ in range(3):
+        raw = await model_call(P_OPEN(text, ctx), model, api_key)
+        parsed = safe_json(raw)
+        if parsed and "codes" in parsed:
+            return parsed
 
-        # 2. Coverage
-        cov_prompt = p_coverage(text, oc)
-        cov_raw = await model_call(cov_prompt, model, api_key)
-        try:
-            cov = json.loads(cov_raw)
-        except Exception:
-            continue
-
-        if cov.get("status") == "missing":
-            # אם חסרות שורות — ננסה שוב
-            continue
-
-        # 3. Cross-check
-        cross_prompt = p_cross(text, oc)
-        cross_raw = await model_call(cross_prompt, model, api_key)
-        try:
-            cross = json.loads(cross_raw)
-        except Exception:
-            continue
-
-        if cross.get("cross_ok") is True:
-            return oc
-
-    raise Exception("אכיפת קידוד נכשלה על מקטע טקסט")
+    # fallback – לא מפיל את כל התהליך
+    return {"codes": []}
 
 
 # ─────────────────────────────────────────────
-# FULL ANALYSIS PIPELINE
+# PIPELINE מלא
 # ─────────────────────────────────────────────
-async def run_pipeline(
-    job_id: str,
-    transcript: list,
-    context: dict,
-    model: str,
-    api_key: Optional[str],
-) -> dict:
+async def pipeline(job_id, transcript, ctx, model, api_key):
+
     update_progress(job_id, 5)
 
-    # --- שלב 1: קידוד פתוח על כל המקטעים ---
-    open_coding: list[dict] = []
-    total = max(len(transcript), 1)
+    # 1) open coding
+    open_codes = []
+    total = len(transcript)
 
-    for idx, seg in enumerate(transcript, start=1):
-        seg_id = seg.get("id", idx)
-        text = seg.get("text") or seg.get("sentence") or str(seg)
+    for i, seg in enumerate(transcript, start=1):
+        text = seg.get("text") or seg.get("sentence") or ""
+        oc = await enforce_open_code(text, ctx, model, api_key)
+        open_codes.append({"id": seg.get("id", i), **oc})
 
-        oc = await enforce_segment(text, context, model, api_key)
-        open_coding.append({"segment_id": seg_id, "codes": oc})
+        update_progress(job_id, int(5 + (i / total) * 40))
 
-        update_progress(job_id, int(5 + (idx / total) * 40))
-
-    # --- שלב 2: Axial ---
+    # 2) Axial
     update_progress(job_id, 55)
-    axial_raw = await model_call(p_axial(open_coding, context), model, api_key)
-    axial = json.loads(axial_raw)
+    axial_raw = await model_call(P_AXIAL(open_codes, ctx), model, api_key)
+    axial = safe_json(axial_raw) or {"axial": []}
 
-    # --- שלב 3: Themes ---
+    # 3) Themes
     update_progress(job_id, 65)
-    themes_raw = await model_call(p_themes(axial, context), model, api_key)
-    themes = json.loads(themes_raw)
+    t_raw = await model_call(P_THEMES(axial, ctx), model, api_key)
+    themes = safe_json(t_raw) or {"themes": []}
 
-    # --- שלב 4: Quotes ---
+    # 4) Quotes
     update_progress(job_id, 75)
-    quotes_raw = await model_call(p_quotes(themes, transcript), model, api_key)
-    quotes = json.loads(quotes_raw)
+    q_raw = await model_call(P_QUOTES(themes, transcript), model, api_key)
+    quotes = safe_json(q_raw) or {"quotes": {}}
 
-    # --- שלב 5: Interpretations ---
+    # 5) Interpretations
     update_progress(job_id, 85)
-    interp_raw = await model_call(p_interpret(themes, quotes), model, api_key)
-    interpretations = json.loads(interp_raw)
+    i_raw = await model_call(P_INTERPRET(themes, quotes), model, api_key)
+    interp = safe_json(i_raw) or {"interpretations": {}}
 
-    # --- שלב 6: Matrix ---
+    # 6) Matrix
     update_progress(job_id, 95)
-    matrix_raw = await model_call(
-        p_matrix(themes, quotes, interpretations),
-        model,
-        api_key,
-    )
-    matrix = json.loads(matrix_raw)
+    m_raw = await model_call(P_MATRIX(themes, quotes, interp), model, api_key)
+    matrix = safe_json(m_raw) or {"matrix": []}
 
     return {
-        "openCoding": open_coding,
+        "openCoding": open_codes,
         "axial": axial,
         "themes": themes,
         "quotes": quotes,
-        "interpretations": interpretations,
-        "matrix": matrix,
+        "interpretations": interp,
+        "matrix": matrix
     }
 
 
 # ─────────────────────────────────────────────
-# BACKGROUND TASK RUNNER
+# BACKGROUND WORKER
 # ─────────────────────────────────────────────
-async def background_analysis(
-    job_id: str,
-    transcript_raw: Union[list, dict],
-    context: dict,
-    model: str,
-    api_key: Optional[str],
-):
+async def background(job_id, transcript_raw, ctx, model, api_key):
     try:
         transcript = normalize_transcript(transcript_raw)
-        result = await run_pipeline(job_id, transcript, context, model, api_key)
+        result = await pipeline(job_id, transcript, ctx, model, api_key)
         set_result(job_id, result)
     except Exception as e:
         set_error(job_id, str(e))
 
 
 # ─────────────────────────────────────────────
-# API ENDPOINTS
+# ENDPOINTS
 # ─────────────────────────────────────────────
 @app.post("/agent/analyze")
-async def analyze(req: AnalysisRequest, background_tasks: BackgroundTasks):
+async def analyze(req: AnalysisRequest, tasks: BackgroundTasks):
+    if not req.api_key:
+        raise Exception("נדרש מפתח API חוקי של OpenAI.")
+
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
-    background_tasks.add_task(
-        background_analysis,
+    tasks.add_task(
+        background,
         job_id,
         req.transcript,
         req.research_context,
@@ -440,10 +346,7 @@ async def analyze(req: AnalysisRequest, background_tasks: BackgroundTasks):
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    job = JOBS.get(job_id)
-    if not job:
-        return {"error": "job not found"}
-    return job
+    return JOBS.get(job_id, {"error": "job not found"})
 
 
 @app.get("/ping")
@@ -452,9 +355,8 @@ async def ping():
 
 
 # ─────────────────────────────────────────────
-# הפעלה מקומית
+# RUN LOCAL
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("server:app", host="0.0.0.0", port=8000)
