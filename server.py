@@ -16,7 +16,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Qualitative Agent – Multi-Model")
+app = FastAPI(title="Qualitative Analysis Agent - Braun & Clarke")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,7 +63,7 @@ def set_error(job_id, err):
 class AnalysisRequest(BaseModel):
     transcript: dict | list
     research_context: dict = {}
-    model: str = "gemini"  # gpt / claude / gemini
+    model: str = "gemini"
     api_key: str | None = None
 
 
@@ -71,16 +71,14 @@ class AnalysisRequest(BaseModel):
 # JSON EXTRACTION HELPER
 # ============================================================
 def extract_json(raw_text: str):
-    """מחלץ JSON מתגובת המודל, גם אם עטופה ב-markdown"""
+    """מחלץ JSON מתגובת המודל"""
     text = raw_text.strip()
     
-    # הסרת markdown code blocks
     code_block_pattern = r'```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```'
     match = re.search(code_block_pattern, text)
     if match:
         text = match.group(1).strip()
     
-    # מציאת תחילת JSON
     if not text.startswith('{') and not text.startswith('['):
         for i, char in enumerate(text):
             if char in '{[':
@@ -100,11 +98,11 @@ def extract_json(raw_text: str):
 async def call_gpt(prompt: str, api_key: str) -> str:
     headers = {"Authorization": f"Bearer {api_key}"}
     body = {
-        "model": "gpt-4o",
+        "model": "gpt-5.1",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
     }
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
@@ -122,10 +120,10 @@ async def call_claude(prompt: str, api_key: str) -> str:
     }
     body = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 4000,
+        "max_tokens": 8000,
         "messages": [{"role": "user", "content": prompt}],
     }
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
@@ -143,9 +141,9 @@ async def call_gemini(prompt: str, api_key: str) -> str:
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3}
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8000}
     }
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(url, json=payload)
     r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -159,12 +157,12 @@ async def model_call(prompt: str, model: str, api_key: str) -> str:
         return await call_gpt(prompt, api_key)
     elif model == "claude":
         return await call_claude(prompt, api_key)
-    else:  # gemini
+    else:
         return await call_gemini(prompt, api_key)
 
 
 # ============================================================
-# TRANSCRIPT EXTRACTION
+# TRANSCRIPT EXTRACTION & FILTERING
 # ============================================================
 def extract_transcript(raw):
     """מחלץ את רשימת המקטעים מהתמלול"""
@@ -180,109 +178,287 @@ def extract_transcript(raw):
     return []
 
 
+def filter_intro_segments(segments: list) -> list:
+    """
+    מסנן מקטעים שאינם חלק מתוכן הראיון עצמו:
+    - הצגות עצמיות
+    - פתיחות טכניות
+    - סגירות
+    """
+    intro_patterns = [
+        r'שלום.*שמי',
+        r'היי.*קוראים לי',
+        r'אני.*המראיין',
+        r'אני.*החוקר',
+        r'תודה שהסכמת',
+        r'תודה שבאת',
+        r'נתחיל.*הראיון',
+        r'לפני שנתחיל',
+        r'אני מקליט',
+        r'האם אפשר להקליט',
+        r'בוא נתחיל',
+        r'תספר.*על עצמך',
+        r'ספר.*קצת על עצמך',
+        r'תציג.*את עצמך',
+        r'מה השם שלך',
+        r'בן כמה אתה',
+        r'מאיפה אתה',
+        r'תודה רבה על.*הראיון',
+        r'זהו.*סיימנו',
+        r'תודה על הזמן',
+        r'נסיים כאן',
+    ]
+    
+    filtered = []
+    skip_intro = True  # מדלג על פתיחות
+    
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+            
+        # בדיקה אם זה מקטע פתיחה/סגירה
+        is_intro = any(re.search(p, text, re.IGNORECASE) for p in intro_patterns)
+        
+        # אם מצאנו תוכן ממשי, מפסיקים לדלג
+        if not is_intro and len(text) > 20:
+            skip_intro = False
+        
+        if skip_intro and is_intro:
+            continue
+            
+        # מדלג על משפטים קצרים מאוד בהתחלה
+        if skip_intro and len(text) < 15:
+            continue
+            
+        filtered.append(seg)
+    
+    return filtered
+
+
 # ============================================================
-# PROMPTS - Braun & Clarke Method
+# PROMPTS - Braun & Clarke (משופרים)
 # ============================================================
-def p_initial_coding(segments):
-    text = "\n".join([
-        f"[{i+1}] {s.get('speaker', 'דובר')}: {s.get('text', '')}"
-        for i, s in enumerate(segments)
-    ])
+def p_filter_content(segments):
+    """פרומפט לסינון תוכן לא רלוונטי"""
+    text = json.dumps(segments, ensure_ascii=False)
     return f"""
-בצע קידוד פתוח (Initial Coding) לפי שיטת Braun & Clarke.
-עבור כל משפט, זהה קודים רלוונטיים.
+אתה מנתח מחקר איכותני מומחה.
+
+קיבלת תמלול ראיון. עליך לסנן ולהחזיר רק את המקטעים שמכילים תוכן מהותי לניתוח.
+
+יש להסיר:
+1. הצגות עצמיות של המרואיין או המראיין
+2. שאלות טכניות (הקלטה, זמן וכו')
+3. פתיחות וסגירות פורמליות
+4. small talk לא רלוונטי
+5. משפטים קצרים כמו "כן", "אוקיי", "בסדר" בלבד
+
+יש לשמור:
+1. תשובות מהותיות של המרואיין
+2. שאלות תוכניות של המראיין
+3. סיפורים, חוויות, דעות
+4. כל תוכן בעל ערך לניתוח
 
 התמלול:
 {text}
 
-החזר JSON בלבד (ללא markdown):
-[
-  {{"segment_index": 1, "text": "הטקסט", "speaker": "דובר", "codes": ["קוד1", "קוד2"]}}
-]
+החזר JSON בלבד - מערך של המקטעים הרלוונטיים בלבד, באותו פורמט:
+[{{"speaker": "...", "text": "...", "start": ..., "end": ...}}]
 """
 
 
-def p_initial_themes(codes):
+def p_initial_coding(segments):
+    """קידוד פתוח"""
+    text = "\n\n".join([
+        f"[מקטע {i+1}] {s.get('speaker', 'דובר')}:\n\"{s.get('text', '')}\""
+        for i, s in enumerate(segments)
+    ])
     return f"""
-קבץ את הקודים הבאים לתימות ראשוניות (Initial Themes) לפי Braun & Clarke.
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
 
-קודים:
-{json.dumps(codes, ensure_ascii=False)}
+בצע קידוד פתוח (Initial Coding) על התמלול הבא.
+עבור כל מקטע, זהה קודים סמנטיים המתארים את התוכן, הרגשות, והמשמעויות.
 
-החזר JSON בלבד:
-[
-  {{"theme": "שם התימה", "codes": ["קוד1", "קוד2"], "description": "תיאור קצר"}}
-]
-"""
+כללים:
+- קודים צריכים להיות תמציתיים (2-5 מילים)
+- קודים צריכים לשקף את תוכן הדברים, לא רק לתאר
+- זהה גם קודים תיאוריים וגם קודים פרשניים
+- התעלם ממקטעים טכניים או חסרי תוכן
 
-
-def p_review_themes(themes, codes):
-    return f"""
-בצע סקירה וחידוד של התימות (Reviewing Themes) לפי Braun & Clarke.
-בדוק שהתימות מגובשות ונפרדות זו מזו.
-
-תימות נוכחיות:
-{json.dumps(themes, ensure_ascii=False)}
-
-קודים מקוריים:
-{json.dumps(codes, ensure_ascii=False)}
-
-החזר JSON בלבד עם תימות מחודדות:
-[
-  {{"theme": "שם מחודד", "codes": ["קוד1"], "description": "תיאור מחודד"}}
-]
-"""
-
-
-def p_define_themes(themes, segments):
-    return f"""
-הגדר ושמה את התימות הסופיות (Define & Name Themes) לפי Braun & Clarke.
-לכל תימה הוסף ציטוטים תומכים מהתמלול.
-
-תימות:
-{json.dumps(themes, ensure_ascii=False)}
-
-תמלול מקורי:
-{json.dumps(segments, ensure_ascii=False)}
+התמלול:
+{text}
 
 החזר JSON בלבד:
 [
   {{
-    "theme": "שם סופי",
-    "definition": "הגדרה מפורטת",
-    "codes": ["קוד1", "קוד2"],
-    "quotes": [
-      {{"text": "ציטוט", "speaker": "דובר", "start": 0, "end": 10}}
-    ]
+    "segment_index": 1,
+    "speaker": "מרואיין",
+    "text": "הטקסט המקורי",
+    "codes": ["קוד 1", "קוד 2", "קוד 3"]
   }}
 ]
 """
 
 
-def p_report(themes_defined):
+def p_initial_themes(codes):
+    """יצירת תימות ראשוניות"""
     return f"""
-כתוב דו"ח מחקרי מסכם (Final Report) לפי Braun & Clarke.
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
+
+על בסיס הקודים הבאים, צור תימות ראשוניות (Initial Themes).
+קבץ קודים דומים לתימות רחבות יותר.
+
+כללים:
+- כל תימה צריכה לכלול לפחות 2-3 קודים קשורים
+- תימות צריכות להיות משמעותיות ולא טריוויאליות
+- הוסף תיאור קצר לכל תימה
+- ציין את הקודים השייכים לכל תימה
+
+הקודים:
+{json.dumps(codes, ensure_ascii=False, indent=2)}
+
+החזר JSON בלבד:
+[
+  {{
+    "theme": "שם התימה",
+    "description": "תיאור קצר של התימה",
+    "codes": ["קוד 1", "קוד 2"],
+    "frequency": 5
+  }}
+]
+"""
+
+
+def p_review_themes(themes, codes):
+    """סקירה וחידוד תימות"""
+    return f"""
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
+
+בצע סקירה וחידוד של התימות (Reviewing Themes).
+
+בדוק:
+1. האם כל תימה מגובשת פנימית?
+2. האם התימות נבדלות זו מזו מספיק?
+3. האם יש תימות שכדאי למזג?
+4. האם יש תימות שכדאי לפצל?
+5. האם כל הקודים משויכים נכון?
+
+תימות נוכחיות:
+{json.dumps(themes, ensure_ascii=False, indent=2)}
+
+קודים מקוריים:
+{json.dumps(codes, ensure_ascii=False, indent=2)}
+
+החזר JSON עם תימות מחודדות:
+[
+  {{
+    "theme": "שם מחודד",
+    "description": "תיאור מעודכן",
+    "codes": ["קוד 1", "קוד 2"],
+    "rationale": "הסבר קצר לשינויים שבוצעו"
+  }}
+]
+"""
+
+
+def p_define_themes(themes, segments):
+    """הגדרה סופית של תימות עם ציטוטים"""
+    return f"""
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
+
+הגדר את התימות הסופיות (Define & Name Themes).
+לכל תימה:
+1. תן שם ברור וממצה
+2. כתוב הגדרה אקדמית מדויקת
+3. הוסף 2-4 ציטוטים תומכים מהתמלול
+4. הסבר את המשמעות התיאורטית
+
+תימות:
+{json.dumps(themes, ensure_ascii=False, indent=2)}
+
+תמלול מקורי:
+{json.dumps(segments, ensure_ascii=False, indent=2)}
+
+החזר JSON בלבד:
+[
+  {{
+    "theme": "שם סופי אקדמי",
+    "definition": "הגדרה אקדמית מפורטת של התימה (2-3 משפטים)",
+    "codes": ["קוד 1", "קוד 2"],
+    "quotes": [
+      {{
+        "text": "ציטוט מדויק מהתמלול",
+        "speaker": "מרואיין",
+        "context": "הקשר קצר"
+      }}
+    ],
+    "theoretical_significance": "משמעות תיאורטית"
+  }}
+]
+"""
+
+
+def p_report(themes_defined, segments):
+    """דו"ח מחקרי מסכם"""
+    return f"""
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
+
+כתוב דו"ח ממצאים מחקרי מקצועי.
+
+הדו"ח צריך לכלול:
+1. תקציר מנהלים (Executive Summary)
+2. סקירת התימות המרכזיות
+3. ממצאים עיקריים לכל תימה
+4. קשרים בין התימות
+5. השלכות מחקריות ומעשיות
+6. מגבלות הניתוח
+
+מספר מקטעים שנותחו: {len(segments)}
 
 תימות מוגדרות:
-{json.dumps(themes_defined, ensure_ascii=False)}
+{json.dumps(themes_defined, ensure_ascii=False, indent=2)}
 
 החזר JSON בלבד:
 {{
-  "summary": "תקציר הממצאים",
-  "themes": [
-    {{"theme": "שם", "findings": "ממצאים", "significance": "משמעות"}}
+  "executive_summary": "תקציר מנהלים (3-4 משפטים)",
+  "methodology_note": "הערה מתודולוגית קצרה",
+  "themes_overview": [
+    {{
+      "theme": "שם התימה",
+      "key_findings": "ממצאים עיקריים (2-3 משפטים)",
+      "prevalence": "שכיחות: גבוהה/בינונית/נמוכה",
+      "significance": "משמעות הממצא"
+    }}
   ],
-  "implications": "השלכות מחקריות ומעשיות"
+  "theme_relationships": "תיאור הקשרים בין התימות",
+  "implications": {{
+    "theoretical": "השלכות תיאורטיות",
+    "practical": "השלכות מעשיות"
+  }},
+  "limitations": "מגבלות הניתוח",
+  "future_research": "כיווני מחקר עתידיים"
 }}
 """
 
 
-def p_matrix(themes_defined):
+def p_matrix(themes_defined, codes):
+    """מטריצת תימות מסכמת"""
     return f"""
-צור מטריצת תימות מסכמת.
+צור מטריצת תימות אקדמית מסכמת.
+
+לכל תימה כלול:
+- שם התימה
+- מספר הקודים
+- מספר הציטוטים
+- תובנה מרכזית
+- רמת שכיחות
 
 תימות:
-{json.dumps(themes_defined, ensure_ascii=False)}
+{json.dumps(themes_defined, ensure_ascii=False, indent=2)}
+
+סה"כ קודים:
+{json.dumps(codes, ensure_ascii=False, indent=2)}
 
 החזר JSON בלבד:
 [
@@ -290,7 +466,9 @@ def p_matrix(themes_defined):
     "theme": "שם התימה",
     "codes_count": 5,
     "quotes_count": 3,
-    "key_insight": "תובנה מרכזית"
+    "prevalence": "גבוהה/בינונית/נמוכה",
+    "key_insight": "תובנה מרכזית במשפט אחד",
+    "sub_themes": ["תת-תימה 1", "תת-תימה 2"]
   }}
 ]
 """
@@ -301,7 +479,7 @@ def p_matrix(themes_defined):
 # ============================================================
 async def run_pipeline(job_id, transcript_raw, ctx, model, api_key):
     try:
-        update_progress(job_id, 5)
+        update_progress(job_id, 2)
         segments = extract_transcript(transcript_raw)
         
         if not segments:
@@ -309,60 +487,88 @@ async def run_pipeline(job_id, transcript_raw, ctx, model, api_key):
         
         logger.info(f"Starting analysis with {len(segments)} segments")
 
-        # שלב 1: קידוד פתוח (20%)
-        update_progress(job_id, 10)
+        # שלב 0: סינון ראשוני בצד שרת
+        update_progress(job_id, 5)
+        segments = filter_intro_segments(segments)
+        logger.info(f"After local filtering: {len(segments)} segments")
+
+        # שלב 1: סינון תוכן באמצעות AI
+        update_progress(job_id, 8)
+        logger.info("Step 0: AI Content Filtering")
+        raw = await model_call(p_filter_content(segments), model, api_key)
+        filtered_segments = extract_json(raw)
+        if filtered_segments and len(filtered_segments) > 0:
+            segments = filtered_segments
+            logger.info(f"After AI filtering: {len(segments)} segments")
+        update_progress(job_id, 15)
+
+        # שלב 2: קידוד פתוח
         logger.info("Step 1: Initial Coding")
         raw = await model_call(p_initial_coding(segments), model, api_key)
         codes = extract_json(raw)
         if not codes:
             codes = [{"segment_index": i+1, "text": s.get("text", ""), "codes": ["קוד כללי"]} 
                      for i, s in enumerate(segments)]
-        update_progress(job_id, 25)
+        update_progress(job_id, 30)
 
-        # שלב 2: תימות ראשוניות (40%)
+        # שלב 3: תימות ראשוניות
         logger.info("Step 2: Initial Themes")
         raw = await model_call(p_initial_themes(codes), model, api_key)
         themes_initial = extract_json(raw)
         if not themes_initial:
             themes_initial = [{"theme": "תימה כללית", "codes": [], "description": ""}]
-        update_progress(job_id, 40)
+        update_progress(job_id, 45)
 
-        # שלב 3: סקירת תימות (55%)
+        # שלב 4: סקירת תימות
         logger.info("Step 3: Reviewing Themes")
         raw = await model_call(p_review_themes(themes_initial, codes), model, api_key)
         themes_reviewed = extract_json(raw)
         if not themes_reviewed:
             themes_reviewed = themes_initial
-        update_progress(job_id, 55)
+        update_progress(job_id, 58)
 
-        # שלב 4: הגדרת תימות (70%)
+        # שלב 5: הגדרת תימות סופיות
         logger.info("Step 4: Define & Name Themes")
         raw = await model_call(p_define_themes(themes_reviewed, segments), model, api_key)
         themes_defined = extract_json(raw)
         if not themes_defined:
             themes_defined = [{"theme": t.get("theme", "תימה"), "definition": "", "codes": t.get("codes", []), "quotes": []} 
                              for t in themes_reviewed]
-        update_progress(job_id, 70)
+        update_progress(job_id, 72)
 
-        # שלב 5: דו"ח סופי (85%)
+        # שלב 6: דו"ח סופי
         logger.info("Step 5: Final Report")
-        raw = await model_call(p_report(themes_defined), model, api_key)
+        raw = await model_call(p_report(themes_defined, segments), model, api_key)
         report = extract_json(raw)
         if not report:
-            report = {"summary": "לא נוצר סיכום", "themes": [], "implications": ""}
-        update_progress(job_id, 85)
+            report = {
+                "executive_summary": "לא נוצר סיכום",
+                "themes_overview": [],
+                "implications": {"theoretical": "", "practical": ""},
+                "limitations": ""
+            }
+        update_progress(job_id, 88)
 
-        # שלב 6: מטריצה (95%)
+        # שלב 7: מטריצה
         logger.info("Step 6: Matrix")
-        raw = await model_call(p_matrix(themes_defined), model, api_key)
+        raw = await model_call(p_matrix(themes_defined, codes), model, api_key)
         matrix = extract_json(raw)
         if not matrix:
             matrix = []
-        update_progress(job_id, 95)
+        update_progress(job_id, 98)
 
         logger.info("Pipeline completed successfully")
         
+        # סטטיסטיקות
+        stats = {
+            "total_segments": len(segments),
+            "total_codes": sum(len(c.get("codes", [])) for c in codes),
+            "total_themes": len(themes_defined),
+            "analysis_model": model
+        }
+        
         return {
+            "statistics": stats,
             "clean_transcript": segments,
             "codes": codes,
             "themes_initial": themes_initial,
