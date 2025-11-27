@@ -938,6 +938,45 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
                 report["future_research"] = f"מומלץ להרחיב את המחקר במדגם גדול יותר ובהקשרים מגוונים. שאלות נוספות שעלו מהניתוח: [יש להשלים בהתאם לממצאים הספציפיים]."
             logger.warning("future_research was missing or empty - using default")
         
+        # ניקוי ציטוטים כפולים מתוך themes_defined
+        if themes_defined:
+            def get_quote_key(quote):
+                """יוצר מפתח ייחודי לציטוט"""
+                if isinstance(quote, str):
+                    return quote.strip()
+                text = quote.get("text", "").strip() if isinstance(quote, dict) else ""
+                timestamp = quote.get("timestamp", "") if isinstance(quote, dict) else ""
+                speaker = quote.get("speaker", "") if isinstance(quote, dict) else ""
+                return f"{text}|{speaker}|{timestamp}"
+            
+            for theme in themes_defined:
+                if "codes_with_quotes" not in theme:
+                    continue
+                
+                # Set לשמירת ציטוטים שכבר ראינו בתימה זו
+                seen_quotes = set()
+                cleaned_codes = []
+                
+                for cq in theme.get("codes_with_quotes", []):
+                    code = cq.get("code", "")
+                    quotes = cq.get("quotes", [])
+                    unique_quotes = []
+                    
+                    for quote in quotes:
+                        quote_key = get_quote_key(quote)
+                        if quote_key not in seen_quotes:
+                            seen_quotes.add(quote_key)
+                            unique_quotes.append(quote)
+                    
+                    if unique_quotes or not quotes:  # שמור קודים גם אם אין להם ציטוטים
+                        cleaned_codes.append({
+                            "code": code,
+                            "quotes": unique_quotes
+                        })
+                
+                theme["codes_with_quotes"] = cleaned_codes
+                logger.info(f"Cleaned duplicate quotes for theme '{theme.get('theme', '')}': {len(cleaned_codes)} codes")
+        
         update_progress(job_id, 95, "מסכם...")
         
         total_quotes = sum(
