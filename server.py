@@ -31,62 +31,69 @@ app.add_middleware(
 # MODEL CONFIGURATIONS (נובמבר 2025)
 # ============================================================
 MODEL_CONFIG = {
-    # Google Gemini - מעודכן!
+    # Google Gemini
     "gemini": {
         "api_name": "gemini-2.0-flash",
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-        "max_retries": 3,
-        "retry_delay": 2,
+        "max_retries": 5,
+        "base_delay": 30,  # המתנה בסיסית בין קריאות
+        "retry_delay": 60,  # המתנה לאחר 429
     },
     "gemini-pro": {
         "api_name": "gemini-1.5-pro",
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-        "max_retries": 3,
-        "retry_delay": 2,
+        "max_retries": 5,
+        "base_delay": 30,
+        "retry_delay": 60,
     },
     "gemini-flash": {
         "api_name": "gemini-1.5-flash",
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-        "max_retries": 3,
-        "retry_delay": 2,
+        "max_retries": 5,
+        "base_delay": 20,
+        "retry_delay": 45,
     },
-    # OpenAI - מעודכן!
+    # OpenAI
     "gpt": {
         "api_name": "gpt-4o",
         "provider": "openai",
         "url": "https://api.openai.com/v1/chat/completions",
         "max_retries": 5,
-        "retry_delay": 5,
+        "base_delay": 5,
+        "retry_delay": 30,
     },
     "gpt-mini": {
         "api_name": "gpt-4o-mini",
         "provider": "openai",
         "url": "https://api.openai.com/v1/chat/completions",
         "max_retries": 5,
-        "retry_delay": 3,
+        "base_delay": 3,
+        "retry_delay": 20,
     },
-    # Anthropic Claude - מעודכן!
+    # Anthropic Claude
     "claude": {
         "api_name": "claude-sonnet-4-20250514",
         "provider": "anthropic",
         "url": "https://api.anthropic.com/v1/messages",
-        "max_retries": 3,
-        "retry_delay": 2,
+        "max_retries": 4,
+        "base_delay": 5,
+        "retry_delay": 30,
     },
     "claude-haiku": {
         "api_name": "claude-haiku-4-20250514",
         "provider": "anthropic",
         "url": "https://api.anthropic.com/v1/messages",
-        "max_retries": 3,
-        "retry_delay": 2,
+        "max_retries": 4,
+        "base_delay": 3,
+        "retry_delay": 20,
     },
 }
 
 # ============================================================
-# JOB STORE
+# JOB STORE - משופר עם מידע על המתנה
 # ============================================================
 JOBS = {}
 
@@ -95,25 +102,45 @@ def create_job(job_id):
     JOBS[job_id] = {
         "status": "running",
         "progress": 0,
+        "step_info": "",
+        "wait_until": None,  # timestamp עד מתי ממתינים
         "result": None,
         "error": None
     }
 
 
-def update_progress(job_id, v):
+def update_progress(job_id, v, step_info=""):
     if job_id in JOBS:
         JOBS[job_id]["progress"] = int(v)
+        JOBS[job_id]["step_info"] = step_info
+        JOBS[job_id]["wait_until"] = None
+
+
+def set_waiting(job_id, seconds):
+    """מעדכן שהמערכת ממתינה בגלל rate limit"""
+    if job_id in JOBS:
+        JOBS[job_id]["status"] = "waiting"
+        JOBS[job_id]["wait_until"] = time.time() + seconds
+        JOBS[job_id]["step_info"] = f"ממתין {seconds} שניות בגלל הגבלת קריאות..."
+
+
+def set_running(job_id):
+    if job_id in JOBS:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["wait_until"] = None
 
 
 def set_result(job_id, r):
     JOBS[job_id]["status"] = "done"
     JOBS[job_id]["progress"] = 100
     JOBS[job_id]["result"] = r
+    JOBS[job_id]["wait_until"] = None
 
 
 def set_error(job_id, err):
     JOBS[job_id]["status"] = "error"
     JOBS[job_id]["error"] = str(err)
+    JOBS[job_id]["wait_until"] = None
 
 
 # ============================================================
@@ -127,51 +154,90 @@ class AnalysisRequest(BaseModel):
 
 
 # ============================================================
-# JSON EXTRACTION HELPER
+# JSON EXTRACTION HELPER - משופר
 # ============================================================
 def extract_json(raw_text: str):
-    """מחלץ JSON מתגובת המודל"""
+    """מחלץ JSON מתגובת המודל - עם טיפול משופר"""
+    if not raw_text:
+        return None
+        
     text = raw_text.strip()
     
+    # נסה למצוא JSON בתוך code block
     code_block_pattern = r'```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```'
     match = re.search(code_block_pattern, text)
     if match:
         text = match.group(1).strip()
     
+    # אם לא מתחיל ב-{ או [, חפש את ההתחלה
     if not text.startswith('{') and not text.startswith('['):
         for i, char in enumerate(text):
             if char in '{[':
                 text = text[i:]
                 break
     
+    # נסה לחתוך עד סוף ה-JSON
+    if text.startswith('{'):
+        # מצא את ה-} האחרון
+        last_brace = text.rfind('}')
+        if last_brace > 0:
+            text = text[:last_brace + 1]
+    elif text.startswith('['):
+        last_bracket = text.rfind(']')
+        if last_bracket > 0:
+            text = text[:last_bracket + 1]
+    
     try:
         return json.loads(text)
-    except:
-        logger.error(f"Failed to parse JSON: {text[:300]}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON: {e}")
+        logger.error(f"Text was: {text[:500]}")
+        
+        # נסיון אחרון - תיקון JSON נפוץ
+        try:
+            # החלף גרשיים בודדים בכפולים
+            fixed = text.replace("'", '"')
+            return json.loads(fixed)
+        except:
+            pass
+        
         return None
 
 
 # ============================================================
-# RETRY DECORATOR FOR RATE LIMITS
+# SMART RATE LIMIT HANDLER
 # ============================================================
-async def retry_with_backoff(func, max_retries=3, base_delay=2, *args, **kwargs):
+async def smart_api_call(func, job_id, config, *args, **kwargs):
     """
-    מבצע retry עם exponential backoff עבור שגיאות rate limit
+    קריאת API חכמה עם:
+    - Exponential backoff
+    - עדכון UI בזמן המתנה
+    - ניסיונות חוזרים חכמים
     """
-    last_exception = None
+    max_retries = config.get("max_retries", 5)
+    base_delay = config.get("base_delay", 10)
+    retry_delay = config.get("retry_delay", 60)
     
     for attempt in range(max_retries):
         try:
-            return await func(*args, **kwargs)
+            set_running(job_id)
+            result = await func(*args, **kwargs)
+            
+            # המתנה בסיסית בין קריאות למניעת rate limit
+            if base_delay > 0:
+                logger.info(f"Waiting {base_delay}s before next call...")
+                await asyncio.sleep(base_delay)
+            
+            return result
+            
         except httpx.HTTPStatusError as e:
-            last_exception = e
             status_code = e.response.status_code
             
-            # Rate limit error (429) or server overload (503)
-            if status_code in [429, 503]:
-                wait_time = base_delay * (2 ** attempt)  # Exponential backoff
+            if status_code == 429:
+                # Rate limit - המתנה ארוכה
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
                 
-                # Check for Retry-After header
+                # בדוק Retry-After header
                 retry_after = e.response.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -179,147 +245,143 @@ async def retry_with_backoff(func, max_retries=3, base_delay=2, *args, **kwargs)
                     except ValueError:
                         pass
                 
-                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                # הגבל ל-5 דקות מקסימום
+                wait_time = min(wait_time, 300)
+                
+                logger.warning(f"Rate limited! Waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                set_waiting(job_id, wait_time)
+                await asyncio.sleep(wait_time)
+                
+            elif status_code == 503:
+                # Server overload
+                wait_time = 30 * (attempt + 1)
+                logger.warning(f"Server overload, waiting {wait_time}s")
+                set_waiting(job_id, wait_time)
+                await asyncio.sleep(wait_time)
+                
+            elif status_code in [401, 403]:
+                raise Exception(f"שגיאת הרשאה ({status_code}): בדוק שמפתח ה-API תקין")
+                
+            elif status_code == 404:
+                raise Exception(f"המודל לא נמצא ({status_code}): ייתכן שאין לך גישה למודל זה")
+                
+            else:
+                raise Exception(f"שגיאת API ({status_code}): {str(e)}")
+                
+        except httpx.TimeoutException:
+            wait_time = 10 * (attempt + 1)
+            logger.warning(f"Timeout, waiting {wait_time}s")
+            if attempt < max_retries - 1:
                 await asyncio.sleep(wait_time)
             else:
-                # For other HTTP errors, don't retry
-                raise
+                raise Exception("תם הזמן המוקצב לתגובה מהשרת. נסה שוב.")
+                
         except Exception as e:
-            last_exception = e
-            logger.error(f"Unexpected error (attempt {attempt + 1}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay)
-            else:
+            if attempt == max_retries - 1:
                 raise
+            logger.error(f"Error on attempt {attempt + 1}: {e}")
+            await asyncio.sleep(5)
     
-    raise last_exception
+    raise Exception(f"נכשל לאחר {max_retries} ניסיונות")
 
 
 # ============================================================
 # AI PROVIDERS
 # ============================================================
 async def call_gpt(prompt: str, api_key: str, model_id: str = "gpt") -> str:
-    """קריאה ל-OpenAI GPT עם retry logic"""
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gpt"])
     
-    async def _make_request():
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        body = {
-            "model": config["api_name"],
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 8000,
-        }
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(config["url"], headers=headers, json=body)
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-    
-    return await retry_with_backoff(
-        _make_request, 
-        max_retries=config["max_retries"],
-        base_delay=config["retry_delay"]
-    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": config["api_name"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 16000,  # הגדלנו!
+    }
+    async with httpx.AsyncClient(timeout=300) as client:  # timeout ארוך יותר
+        r = await client.post(config["url"], headers=headers, json=body)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
 
 
 async def call_claude(prompt: str, api_key: str, model_id: str = "claude") -> str:
-    """קריאה ל-Anthropic Claude עם retry logic"""
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["claude"])
     
-    async def _make_request():
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        body = {
-            "model": config["api_name"],
-            "max_tokens": 8000,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(config["url"], headers=headers, json=body)
-            r.raise_for_status()
-            return r.json()["content"][0]["text"]
-    
-    return await retry_with_backoff(
-        _make_request,
-        max_retries=config["max_retries"],
-        base_delay=config["retry_delay"]
-    )
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": config["api_name"],
+        "max_tokens": 16000,  # הגדלנו!
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(config["url"], headers=headers, json=body)
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
 
 
 async def call_gemini(prompt: str, api_key: str, model_id: str = "gemini") -> str:
-    """קריאה ל-Google Gemini עם retry logic"""
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gemini"])
     
-    async def _make_request():
-        url = config["url_template"].format(
-            model=config["api_name"],
-            api_key=api_key
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 8000
-            }
-        }
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            response = r.json()
-            
-            # Handle different response formats
-            if "candidates" in response:
-                return response["candidates"][0]["content"]["parts"][0]["text"]
-            elif "error" in response:
-                raise Exception(f"Gemini API error: {response['error'].get('message', 'Unknown error')}")
-            else:
-                raise Exception(f"Unexpected Gemini response format: {response}")
-    
-    return await retry_with_backoff(
-        _make_request,
-        max_retries=config["max_retries"],
-        base_delay=config["retry_delay"]
+    url = config["url_template"].format(
+        model=config["api_name"],
+        api_key=api_key
     )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 16000  # הגדלנו!
+        }
+    }
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        response = r.json()
+        
+        if "candidates" in response and len(response["candidates"]) > 0:
+            return response["candidates"][0]["content"]["parts"][0]["text"]
+        elif "error" in response:
+            raise Exception(f"Gemini API error: {response['error'].get('message', 'Unknown error')}")
+        else:
+            raise Exception(f"Unexpected Gemini response: {json.dumps(response)[:200]}")
 
 
-async def model_call(prompt: str, model: str, api_key: str) -> str:
-    """קריאה למודל AI לפי בחירה"""
+async def model_call(prompt: str, model: str, api_key: str, job_id: str) -> str:
+    """קריאה למודל AI עם ניהול חכם של rate limits"""
     if not api_key:
         raise Exception("חסר API Key")
     
-    # Determine provider from model ID
-    if model in MODEL_CONFIG:
-        provider = MODEL_CONFIG[model]["provider"]
-    else:
-        # Default mapping for backward compatibility
-        if "gpt" in model.lower():
-            provider = "openai"
-        elif "claude" in model.lower():
-            provider = "anthropic"
-        else:
-            provider = "google"
+    config = MODEL_CONFIG.get(model, MODEL_CONFIG.get("gemini"))
+    provider = config["provider"]
     
     logger.info(f"Calling {model} (provider: {provider})")
     
     if provider == "openai":
-        return await call_gpt(prompt, api_key, model)
+        call_func = call_gpt
     elif provider == "anthropic":
-        return await call_claude(prompt, api_key, model)
+        call_func = call_claude
     else:
-        return await call_gemini(prompt, api_key, model)
+        call_func = call_gemini
+    
+    return await smart_api_call(
+        call_func,
+        job_id,
+        config,
+        prompt, api_key, model
+    )
 
 
 # ============================================================
 # TRANSCRIPT EXTRACTION & FILTERING
 # ============================================================
 def extract_transcript(raw):
-    """מחלץ את רשימת המקטעים מהתמלול"""
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
@@ -333,31 +395,11 @@ def extract_transcript(raw):
 
 
 def filter_intro_segments(segments: list) -> list:
-    """
-    מסנן מקטעים שאינם חלק מתוכן הראיון עצמו
-    """
     intro_patterns = [
-        r'שלום.*שמי',
-        r'היי.*קוראים לי',
-        r'אני.*המראיין',
-        r'אני.*החוקר',
-        r'תודה שהסכמת',
-        r'תודה שבאת',
-        r'נתחיל.*הראיון',
-        r'לפני שנתחיל',
-        r'אני מקליט',
-        r'האם אפשר להקליט',
-        r'בוא נתחיל',
-        r'תספר.*על עצמך',
-        r'ספר.*קצת על עצמך',
-        r'תציג.*את עצמך',
-        r'מה השם שלך',
-        r'בן כמה אתה',
-        r'מאיפה אתה',
-        r'תודה רבה על.*הראיון',
-        r'זהו.*סיימנו',
-        r'תודה על הזמן',
-        r'נסיים כאן',
+        r'שלום.*שמי', r'היי.*קוראים לי', r'אני.*המראיין',
+        r'תודה שהסכמת', r'נתחיל.*הראיון', r'לפני שנתחיל',
+        r'אני מקליט', r'בוא נתחיל', r'תספר.*על עצמך',
+        r'תודה רבה על.*הראיון', r'זהו.*סיימנו', r'נסיים כאן',
     ]
     
     filtered = []
@@ -365,14 +407,12 @@ def filter_intro_segments(segments: list) -> list:
     
     for seg in segments:
         text = seg.get("text", "").strip()
-        if not text:
+        if not text or len(text) < 5:
             continue
         is_intro = any(re.search(p, text, re.IGNORECASE) for p in intro_patterns)
         if not is_intro and len(text) > 20:
             skip_intro = False
-        if skip_intro and is_intro:
-            continue
-        if skip_intro and len(text) < 15:
+        if skip_intro and (is_intro or len(text) < 15):
             continue
         filtered.append(seg)
     
@@ -380,334 +420,247 @@ def filter_intro_segments(segments: list) -> list:
 
 
 # ============================================================
-# PROMPTS - Braun & Clarke
+# COMBINED PROMPTS - פחות קריאות, יותר תוכן!
 # ============================================================
-def p_filter_content(segments):
-    text = json.dumps(segments, ensure_ascii=False)
-    return f"""
-אתה מנתח מחקר איכותני מומחה.
 
-קיבלת תמלול ראיון. עליך לסנן ולהחזיר רק את המקטעים שמכילים תוכן מהותי לניתוח.
-
-יש להסיר:
-1. הצגות עצמיות של המרואיין או המראיין
-2. שאלות טכניות (הקלטה, זמן וכו')
-3. פתיחות וסגירות פורמליות
-4. small talk לא רלוונטי
-5. משפטים קצרים כמו "כן", "אוקיי", "בסדר" בלבד
-
-יש לשמור:
-1. תשובות מהותיות של המרואיין
-2. שאלות תוכניות של המראיין
-3. סיפורים, חוויות, דעות
-4. כל תוכן בעל ערך לניתוח
-
-התמלול:
-{text}
-
-החזר JSON בלבד - מערך של המקטעים הרלוונטיים בלבד:
-[{{"speaker": "...", "text": "...", "start": ..., "end": ...}}]
-"""
-
-
-def p_initial_coding(segments):
+def p_coding_and_themes(segments):
+    """פרומפט משולב: סינון + קידוד + תימות ראשוניות - קריאה אחת!"""
     text = "\n\n".join([
-        f"[מקטע {i+1}] {s.get('speaker', 'דובר')}:\n\"{s.get('text', '')}\""
-        for i, s in enumerate(segments)
+        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')}\""
+        for i, s in enumerate(segments[:50])  # הגבלה ל-50 מקטעים
     ])
+    
     return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
 
-בצע קידוד פתוח (Initial Coding) על התמלול הבא.
-עבור כל מקטע, זהה קודים סמנטיים המתארים את התוכן, הרגשות, והמשמעויות.
+קיבלת תמלול ראיון. בצע ניתוח מקיף בשלב אחד:
 
-כללים:
-- קודים צריכים להיות תמציתיים (2-5 מילים)
-- קודים צריכים להיות בעברית
-- זהה לפחות 2-4 קודים למקטע משמעותי
-- השתמש בשפה של המרואיין כשאפשר
-- הימנע מפרשנות מוקדמת
+## שלב 1: זיהוי מקטעים רלוונטיים
+סנן והתעלם מ: הצגות עצמיות, שאלות טכניות, פתיחות/סגירות, small talk.
+
+## שלב 2: קידוד פתוח (Initial Coding)
+לכל מקטע רלוונטי, צור קודים סמנטיים (2-5 מילים כל קוד).
+
+## שלב 3: זיהוי תימות ראשוניות
+קבץ את הקודים לתימות משמעותיות (3-6 תימות).
 
 התמלול:
 {text}
 
-החזר JSON בלבד:
-[
-  {{
-    "segment_index": 1,
-    "text": "הטקסט המקורי",
-    "codes": ["קוד 1", "קוד 2", "קוד 3"],
-    "memo": "הערה קצרה (אופציונלי)"
-  }}
-]
-"""
-
-
-def p_initial_themes(codes):
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
-
-בצע קיבוץ קודים לתימות ראשוניות (Searching for Themes).
-חפש דפוסים וקשרים בין הקודים.
-
-כללים:
-- תימה צריכה לאגד קודים בעלי משמעות משותפת
-- כל תימה צריכה שם ברור ותיאור קצר
-- תימה טובה מספרת "סיפור" קוהרנטי
-
-קודים מהניתוח:
-{json.dumps(codes, ensure_ascii=False, indent=2)}
-
-החזר JSON בלבד:
-[
-  {{
-    "theme": "שם התימה",
-    "description": "תיאור קצר (משפט אחד)",
-    "codes": ["קוד 1", "קוד 2"],
-    "potential_subthemes": ["תת-תימה אפשרית"]
-  }}
-]
-"""
-
-
-def p_review_themes(themes, codes):
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
-
-בצע סקירת תימות (Reviewing Themes).
-בדוק:
-1. האם כל תימה קוהרנטית פנימית?
-2. האם יש הבחנה ברורה בין תימות?
-3. האם יש תימות שכדאי למזג?
-4. האם יש תימות שכדאי לפצל?
-5. האם כל הקודים משויכים נכון?
-
-תימות נוכחיות:
-{json.dumps(themes, ensure_ascii=False, indent=2)}
-
-קודים מקוריים:
-{json.dumps(codes, ensure_ascii=False, indent=2)}
-
-החזר JSON עם תימות מחודדות:
-[
-  {{
-    "theme": "שם מחודד",
-    "description": "תיאור מעודכן",
-    "codes": ["קוד 1", "קוד 2"],
-    "rationale": "הסבר קצר לשינויים"
-  }}
-]
-"""
-
-
-def p_define_themes(themes, segments):
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
-
-הגדר את התימות הסופיות (Define & Name Themes).
-לכל תימה:
-1. תן שם ברור וממצה
-2. כתוב הגדרה אקדמית מדויקת
-3. הוסף 2-4 ציטוטים תומכים מהתמלול
-4. הסבר את המשמעות התיאורטית
-
-תימות:
-{json.dumps(themes, ensure_ascii=False, indent=2)}
-
-תמלול מקורי:
-{json.dumps(segments, ensure_ascii=False, indent=2)}
-
-החזר JSON בלבד:
-[
-  {{
-    "theme": "שם סופי אקדמי",
-    "definition": "הגדרה אקדמית מפורטת (2-3 משפטים)",
-    "codes": ["קוד 1", "קוד 2"],
-    "quotes": [
-      {{
-        "text": "ציטוט מדויק מהתמלול",
-        "speaker": "מרואיין",
-        "context": "הקשר קצר"
-      }}
-    ],
-    "theoretical_significance": "משמעות תיאורטית"
-  }}
-]
-"""
-
-
-def p_report(themes_defined, segments):
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
-
-כתוב דו"ח ממצאים מחקרי מקצועי.
-
-הדו"ח צריך לכלול:
-1. תקציר מנהלים
-2. סקירת התימות המרכזיות
-3. ממצאים עיקריים לכל תימה
-4. קשרים בין התימות
-5. השלכות מחקריות ומעשיות
-6. מגבלות הניתוח
-
-מספר מקטעים שנותחו: {len(segments)}
-
-תימות מוגדרות:
-{json.dumps(themes_defined, ensure_ascii=False, indent=2)}
-
-החזר JSON בלבד:
+החזר JSON בלבד במבנה הבא:
 {{
-  "executive_summary": "תקציר מנהלים (3-4 משפטים)",
-  "methodology_note": "הערה מתודולוגית קצרה",
-  "themes_overview": [
+  "codes": [
     {{
-      "theme": "שם התימה",
-      "key_findings": "ממצאים עיקריים (2-3 משפטים)",
-      "prevalence": "שכיחות: גבוהה/בינונית/נמוכה",
-      "significance": "משמעות הממצא"
+      "segment_index": 1,
+      "text": "טקסט מקוצר של המקטע",
+      "codes": ["קוד 1", "קוד 2"],
+      "speaker": "דובר"
     }}
   ],
-  "theme_relationships": "תיאור הקשרים בין התימות",
-  "implications": {{
-    "theoretical": "השלכות תיאורטיות",
-    "practical": "השלכות מעשיות"
-  }},
-  "limitations": "מגבלות הניתוח",
-  "future_research": "כיווני מחקר עתידיים"
+  "initial_themes": [
+    {{
+      "theme": "שם התימה",
+      "description": "תיאור קצר",
+      "codes": ["קוד 1", "קוד 2", "קוד 3"]
+    }}
+  ]
 }}
 """
 
 
-def p_matrix(themes_defined, codes):
+def p_define_and_report(themes, codes, segments):
+    """פרומפט משולב: הגדרת תימות + דו"ח + מטריצה - קריאה אחת!"""
+    
+    # הכן ציטוטים אפשריים
+    quotes_text = "\n".join([
+        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')[:200]}\""
+        for i, s in enumerate(segments[:30])
+    ])
+    
     return f"""
-צור מטריצת תימות אקדמית מסכמת.
+אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
 
-לכל תימה כלול:
-- שם התימה
-- מספר הקודים
-- מספר הציטוטים
-- תובנה מרכזית
-- רמת שכיחות
+בצע ניתוח סופי מקיף:
 
-תימות:
-{json.dumps(themes_defined, ensure_ascii=False, indent=2)}
+## תימות לעיבוד:
+{json.dumps(themes, ensure_ascii=False, indent=2)}
 
-סה"כ קודים:
-{json.dumps(codes, ensure_ascii=False, indent=2)}
+## קודים שזוהו:
+{json.dumps(codes[:30], ensure_ascii=False, indent=2)}
+
+## ציטוטים מהתמלול (בחר מתאימים):
+{quotes_text}
+
+## משימות:
+
+### 1. הגדר תימות סופיות
+לכל תימה: שם אקדמי, הגדרה מפורטת, ציטוטים תומכים מהתמלול.
+
+### 2. כתוב דו"ח ממצאים
+תקציר מנהלים, סקירת תימות, קשרים, השלכות.
+
+### 3. צור מטריצת סיכום
+לכל תימה: מספר קודים, ציטוטים, תובנה מרכזית.
 
 החזר JSON בלבד:
-[
-  {{
-    "theme": "שם התימה",
-    "codes_count": 5,
-    "quotes_count": 3,
-    "prevalence": "גבוהה/בינונית/נמוכה",
-    "key_insight": "תובנה מרכזית במשפט אחד",
-    "sub_themes": ["תת-תימה 1", "תת-תימה 2"]
-  }}
-]
+{{
+  "themes_defined": [
+    {{
+      "theme": "שם התימה האקדמי",
+      "definition": "הגדרה מפורטת (2-3 משפטים)",
+      "codes": ["קוד 1", "קוד 2"],
+      "quotes": [
+        {{
+          "text": "ציטוט מדויק",
+          "speaker": "מרואיין",
+          "context": "הקשר"
+        }}
+      ],
+      "theoretical_significance": "משמעות תיאורטית"
+    }}
+  ],
+  "report": {{
+    "executive_summary": "תקציר מנהלים מקיף (4-5 משפטים)",
+    "methodology_note": "הערה מתודולוגית",
+    "themes_overview": [
+      {{
+        "theme": "שם",
+        "key_findings": "ממצאים עיקריים",
+        "prevalence": "גבוהה/בינונית/נמוכה",
+        "significance": "משמעות"
+      }}
+    ],
+    "theme_relationships": "קשרים בין תימות",
+    "implications": {{
+      "theoretical": "השלכות תיאורטיות",
+      "practical": "השלכות מעשיות"
+    }},
+    "limitations": "מגבלות",
+    "future_research": "כיווני מחקר"
+  }},
+  "matrix": [
+    {{
+      "theme": "שם",
+      "codes_count": 5,
+      "quotes_count": 3,
+      "prevalence": "גבוהה",
+      "key_insight": "תובנה מרכזית",
+      "sub_themes": ["תת-תימה"]
+    }}
+  ]
+}}
 """
 
 
 # ============================================================
-# PIPELINE - Full Braun & Clarke
+# OPTIMIZED PIPELINE - רק 2 קריאות API!
 # ============================================================
 async def run_pipeline(job_id, transcript_raw, ctx, model, api_key):
     try:
-        update_progress(job_id, 2)
+        update_progress(job_id, 5, "טוען תמלול...")
         segments = extract_transcript(transcript_raw)
         
         if not segments:
             raise Exception("לא נמצאו מקטעים בתמלול")
         
-        logger.info(f"Starting analysis with {len(segments)} segments, model: {model}")
+        logger.info(f"Starting optimized analysis with {len(segments)} segments")
 
-        # שלב 0: סינון ראשוני בצד שרת
-        update_progress(job_id, 5)
+        # סינון מקומי
+        update_progress(job_id, 10, "מסנן תוכן לא רלוונטי...")
         segments = filter_intro_segments(segments)
-        logger.info(f"After local filtering: {len(segments)} segments")
+        logger.info(f"After filtering: {len(segments)} segments")
 
-        # שלב 1: סינון תוכן באמצעות AI
-        update_progress(job_id, 8)
-        logger.info("Step 0: AI Content Filtering")
-        raw = await model_call(p_filter_content(segments), model, api_key)
-        filtered_segments = extract_json(raw)
-        if filtered_segments and len(filtered_segments) > 0:
-            segments = filtered_segments
-            logger.info(f"After AI filtering: {len(segments)} segments")
-        update_progress(job_id, 15)
+        if len(segments) == 0:
+            raise Exception("לא נשאר תוכן לניתוח לאחר סינון")
 
-        # שלב 2: קידוד פתוח
-        logger.info("Step 1: Initial Coding")
-        raw = await model_call(p_initial_coding(segments), model, api_key)
-        codes = extract_json(raw)
-        if not codes:
-            codes = [{"segment_index": i+1, "text": s.get("text", ""), "codes": ["קוד כללי"]} 
-                     for i, s in enumerate(segments)]
-        update_progress(job_id, 30)
-
-        # שלב 3: תימות ראשוניות
-        logger.info("Step 2: Initial Themes")
-        raw = await model_call(p_initial_themes(codes), model, api_key)
-        themes_initial = extract_json(raw)
-        if not themes_initial:
-            themes_initial = [{"theme": "תימה כללית", "codes": [], "description": ""}]
-        update_progress(job_id, 45)
-
-        # שלב 4: סקירת תימות
-        logger.info("Step 3: Reviewing Themes")
-        raw = await model_call(p_review_themes(themes_initial, codes), model, api_key)
-        themes_reviewed = extract_json(raw)
-        if not themes_reviewed:
-            themes_reviewed = themes_initial
-        update_progress(job_id, 58)
-
-        # שלב 5: הגדרת תימות סופיות
-        logger.info("Step 4: Define & Name Themes")
-        raw = await model_call(p_define_themes(themes_reviewed, segments), model, api_key)
-        themes_defined = extract_json(raw)
-        if not themes_defined:
-            themes_defined = [{"theme": t.get("theme", "תימה"), "definition": "", "codes": t.get("codes", []), "quotes": []} 
-                             for t in themes_reviewed]
-        update_progress(job_id, 72)
-
-        # שלב 6: דו"ח סופי
-        logger.info("Step 5: Final Report")
-        raw = await model_call(p_report(themes_defined, segments), model, api_key)
-        report = extract_json(raw)
-        if not report:
-            report = {
-                "executive_summary": "לא נוצר סיכום",
-                "themes_overview": [],
-                "implications": {"theoretical": "", "practical": ""},
-                "limitations": ""
-            }
-        update_progress(job_id, 88)
-
-        # שלב 7: מטריצה
-        logger.info("Step 6: Matrix")
-        raw = await model_call(p_matrix(themes_defined, codes), model, api_key)
-        matrix = extract_json(raw)
-        if not matrix:
-            matrix = []
-        update_progress(job_id, 98)
-
-        logger.info("Pipeline completed successfully")
+        # ========== קריאה 1: קידוד + תימות ראשוניות ==========
+        update_progress(job_id, 20, "שלב 1/2: קידוד וזיהוי תימות ראשוניות...")
+        logger.info("Step 1: Coding and Initial Themes (combined)")
         
-        # סטטיסטיקות
+        raw1 = await model_call(p_coding_and_themes(segments), model, api_key, job_id)
+        result1 = extract_json(raw1)
+        
+        if not result1:
+            logger.error("Failed to parse step 1 result")
+            # יצירת ברירת מחדל
+            result1 = {
+                "codes": [{"segment_index": i+1, "text": s.get("text", "")[:100], "codes": ["קוד כללי"], "speaker": s.get("speaker", "")} 
+                         for i, s in enumerate(segments[:20])],
+                "initial_themes": [{"theme": "תימה כללית", "description": "תימה שזוהתה בניתוח", "codes": ["קוד כללי"]}]
+            }
+        
+        codes = result1.get("codes", [])
+        themes_initial = result1.get("initial_themes", [])
+        
+        logger.info(f"Found {len(codes)} coded segments, {len(themes_initial)} initial themes")
+        update_progress(job_id, 50, "שלב 1 הושלם. ממתין לפני שלב 2...")
+
+        # ========== קריאה 2: הגדרה + דו"ח + מטריצה ==========
+        update_progress(job_id, 55, "שלב 2/2: הגדרת תימות, דו\"ח ומטריצה...")
+        logger.info("Step 2: Define, Report and Matrix (combined)")
+        
+        raw2 = await model_call(p_define_and_report(themes_initial, codes, segments), model, api_key, job_id)
+        result2 = extract_json(raw2)
+        
+        if not result2:
+            logger.error("Failed to parse step 2 result")
+            # יצירת ברירת מחדל
+            result2 = {
+                "themes_defined": [
+                    {
+                        "theme": t.get("theme", "תימה"),
+                        "definition": t.get("description", "תימה שזוהתה בניתוח"),
+                        "codes": t.get("codes", []),
+                        "quotes": [],
+                        "theoretical_significance": ""
+                    }
+                    for t in themes_initial
+                ],
+                "report": {
+                    "executive_summary": f"נותחו {len(segments)} מקטעים וזוהו {len(themes_initial)} תימות מרכזיות.",
+                    "methodology_note": "ניתוח תמטי לפי Braun & Clarke (2006)",
+                    "themes_overview": [
+                        {"theme": t.get("theme", ""), "key_findings": t.get("description", ""), "prevalence": "בינונית", "significance": ""}
+                        for t in themes_initial
+                    ],
+                    "theme_relationships": "נמצאו קשרים בין התימות",
+                    "implications": {"theoretical": "", "practical": ""},
+                    "limitations": "מגבלות הניתוח האוטומטי",
+                    "future_research": ""
+                },
+                "matrix": [
+                    {"theme": t.get("theme", ""), "codes_count": len(t.get("codes", [])), "quotes_count": 0, "prevalence": "בינונית", "key_insight": t.get("description", ""), "sub_themes": []}
+                    for t in themes_initial
+                ]
+            }
+
+        update_progress(job_id, 95, "מסכם תוצאות...")
+
+        # הרכב תוצאה סופית
+        themes_defined = result2.get("themes_defined", [])
+        report = result2.get("report", {})
+        matrix = result2.get("matrix", [])
+        
+        # וודא שיש executive_summary
+        if not report.get("executive_summary"):
+            report["executive_summary"] = f"ניתוח תמטי של {len(segments)} מקטעים העלה {len(themes_defined)} תימות מרכזיות."
+        
         stats = {
             "total_segments": len(segments),
             "total_codes": sum(len(c.get("codes", [])) for c in codes),
             "total_themes": len(themes_defined),
-            "analysis_model": model
+            "analysis_model": model,
+            "api_calls": 2  # רק 2 קריאות!
         }
+        
+        logger.info(f"Pipeline completed: {stats}")
         
         return {
             "statistics": stats,
             "clean_transcript": segments,
             "codes": codes,
             "themes_initial": themes_initial,
-            "themes_reviewed": themes_reviewed,
+            "themes_reviewed": themes_initial,  # אותו דבר בגרסה המצומצמת
             "themes_defined": themes_defined,
             "report": report,
             "matrix": matrix
@@ -748,7 +701,16 @@ async def analyze(req: AnalysisRequest):
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    return JOBS.get(job_id, {"error": "not found"})
+    job = JOBS.get(job_id, {"error": "not found"})
+    
+    # חשב זמן המתנה נותר
+    if job.get("wait_until"):
+        remaining = max(0, int(job["wait_until"] - time.time()))
+        job["wait_remaining"] = remaining
+    else:
+        job["wait_remaining"] = 0
+    
+    return job
 
 
 @app.get("/ping")
@@ -758,15 +720,10 @@ async def ping():
 
 @app.get("/models")
 async def get_models():
-    """מחזיר רשימת מודלים זמינים"""
     return {
         "models": [
-            {
-                "id": model_id,
-                "name": config["api_name"],
-                "provider": config["provider"]
-            }
-            for model_id, config in MODEL_CONFIG.items()
+            {"id": mid, "name": cfg["api_name"], "provider": cfg["provider"]}
+            for mid, cfg in MODEL_CONFIG.items()
         ]
     }
 
