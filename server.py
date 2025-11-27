@@ -5,6 +5,7 @@ import re
 import logging
 import time
 from typing import Union, Optional
+from collections import deque
 
 from fastapi import FastAPI, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +38,10 @@ MODEL_CONFIG = {
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         "max_retries": 5,
-        "base_delay": 25,
+        # הגבלות קצב: ~15 RPM (תוכנית חינמית) או 60+ RPM (תוכנית בתשלום)
+        # base_delay מחושב דינמית לפי RPM tracking
+        "rpm_limit": 12,  # שמרני - מעט מתחת למגבלה כדי להימנע מ-429
+        "base_delay": 5,  # עיכוב מינימלי בין קריאות (ישמש רק אם אין RPM tracking)
         "retry_delay": 60,
         "max_segments_per_chunk": 35,
     },
@@ -47,9 +51,23 @@ MODEL_CONFIG = {
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         "max_retries": 5,
-        "base_delay": 25,
+        # הגבלות קצב: ~15 RPM (תוכנית חינמית) או 60+ RPM (תוכנית בתשלום)
+        "rpm_limit": 12,
+        "base_delay": 5,
         "retry_delay": 60,
         "max_segments_per_chunk": 40,
+    },
+    "gemini-lite": {
+        "api_name": "gemini-2.0-flash-lite",
+        "display_name": "Gemini 2.0 Flash-Lite",
+        "provider": "google",
+        "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "max_retries": 5,
+        # הגבלות קצב: 4,000 RPM - גבוה מאוד! לא צריך RPM tracking מורכב
+        "rpm_limit": 3800,  # שמרני - מעט מתחת למגבלה
+        "base_delay": 0.015,  # ~15ms בין קריאות (מתאים ל-4000 RPM)
+        "retry_delay": 30,
+        "max_segments_per_chunk": 50,  # יכול לטפל ביותר מקטעים בגלל חלון הקלט הגדול
     },
     "gpt": {
         "api_name": "gpt-4o",
@@ -97,6 +115,53 @@ MODEL_CONFIG = {
 # JOB STORE
 # ============================================================
 JOBS = {}
+
+# ============================================================
+# RPM TRACKING - מעקב אחר בקשות לדקה לכל מודל
+# ============================================================
+# מטפל בהגבלות קצב בצורה חכמה יותר
+RPM_TRACKERS = {}  # {model_id: deque of timestamps}
+
+
+def get_rpm_tracker(model_id: str):
+    """מחזיר את ה-tracker של RPM למודל מסוים"""
+    if model_id not in RPM_TRACKERS:
+        RPM_TRACKERS[model_id] = deque(maxlen=100)  # שומר עד 100 קריאות אחרונות
+    return RPM_TRACKERS[model_id]
+
+
+async def wait_for_rpm_slot(model_id: str, config: dict):
+    """
+    ממתין עד שיש מקום בקווטה של RPM
+    מחשב את הזמן הנדרש לפני הקריאה הבאה
+    """
+    rpm_limit = config.get("rpm_limit", 15)
+    base_delay = config.get("base_delay", 5)
+    tracker = get_rpm_tracker(model_id)
+    now = time.time()
+    
+    # מנקה קריאות ישנות (יותר מדקה)
+    while tracker and (now - tracker[0]) > 60:
+        tracker.popleft()
+    
+    # אם הגענו למגבלה, ממתין עד שהקריאה הראשונה תתפנה
+    if len(tracker) >= rpm_limit:
+        oldest_time = tracker[0]
+        wait_time = 60 - (now - oldest_time) + 0.5  # +0.5 שניות ביטחון
+        if wait_time > 0:
+            logger.info(f"RPM limit reached ({len(tracker)}/{rpm_limit}). Waiting {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
+            # מנקה שוב אחרי ההמתנה
+            now = time.time()
+            while tracker and (now - tracker[0]) > 60:
+                tracker.popleft()
+    # עבור מודלים עם RPM גבוה מאוד (כמו gemini-lite), משתמש ב-base_delay מינימלי
+    elif base_delay > 0 and base_delay < 1:
+        # עיכוב מינימלי בין קריאות (רק עבור מודלים מהירים מאוד)
+        await asyncio.sleep(base_delay)
+    
+    # מוסיף את הזמן הנוכחי ל-tracker
+    tracker.append(time.time())
 
 
 def create_job(job_id):
@@ -242,17 +307,29 @@ def extract_json(raw_text: str):
 # ============================================================
 # SMART RATE LIMIT HANDLER
 # ============================================================
-async def smart_api_call(func, job_id, config, *args, **kwargs):
+async def smart_api_call(func, job_id, config, model_id: str, *args, **kwargs):
+    """
+    קריאה חכמה ל-API עם ניהול הגבלות קצב
+    model_id: מזהה המודל (למעקב RPM)
+    """
     max_retries = config.get("max_retries", 5)
     base_delay = config.get("base_delay", 10)
     retry_delay = config.get("retry_delay", 60)
+    provider = config.get("provider", "google")
     
     for attempt in range(max_retries):
         try:
             set_running(job_id)
+            
+            # ניהול RPM רק ל-Google (Gemini)
+            if provider == "google":
+                await wait_for_rpm_slot(model_id, config)
+            
             result = await func(*args, **kwargs)
             
-            if base_delay > 0:
+            # עיכוב בסיסי בין קריאות (רק אם לא משתמשים ב-RPM tracking)
+            # עבור Google, ה-RPM tracking כבר מטפל בזה
+            if base_delay > 0 and provider != "google":
                 logger.info(f"Waiting {base_delay}s before next call...")
                 await asyncio.sleep(base_delay)
             
@@ -377,7 +454,8 @@ async def model_call(prompt: str, model: str, api_key: str, job_id: str) -> str:
         call_func = call_claude
     else:
         call_func = call_gemini
-    return await smart_api_call(call_func, job_id, config, prompt, api_key, model)
+    # מעביר את model_id ל-smart_api_call למעקב RPM
+    return await smart_api_call(call_func, job_id, config, model, prompt, api_key, model)
 
 
 # ============================================================
