@@ -101,16 +101,6 @@ MODEL_CONFIG = {
         "retry_delay": 20,
         "max_segments_per_chunk": 25,
     },
-    "gpt-5.1": {
-        "api_name": "gpt-5.1",
-        "display_name": "GPT-5.1",
-        "provider": "openai",
-        "url": "https://api.openai.com/v1/chat/completions",
-        "max_retries": 5,
-        "base_delay": 5,
-        "retry_delay": 30,
-        "max_segments_per_chunk": 35,
-    },
     "claude": {
         "api_name": "claude-sonnet-4-20250514",
         "display_name": "Claude Sonnet 4",
@@ -423,7 +413,17 @@ async def call_gpt(prompt: str, api_key: str, model_id: str = "gpt") -> str:
     }
     async with httpx.AsyncClient(timeout=300) as client:
         r = await client.post(config["url"], headers=headers, json=body)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                error_data = e.response.json() if e.response.headers.get("content-type", "").startswith("application/json") else {}
+                error_msg = error_data.get("error", {}).get("message", str(e))
+                # בדיקה אם המודל לא נתמך
+                if "model" in error_msg.lower() and ("not found" in error_msg.lower() or "does not exist" in error_msg.lower() or "invalid" in error_msg.lower()):
+                    raise Exception(f"המודל '{config['api_name']}' לא נתמך או לא זמין. שגיאת API: {error_msg}")
+                raise Exception(f"שגיאת בקשה (400): {error_msg}")
+            raise
         return r.json()["choices"][0]["message"]["content"]
 
 
