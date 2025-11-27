@@ -608,7 +608,7 @@ async def analyze(req: AnalysisRequest):
         background_run(job_id, req.transcript, req.research_context, req.model, req.api_key)
     )
     
-    return {"job_id": job_id, "status": "processing"}
+    return {"job_id": job_id, "status": "running"}
 
 
 @app.get("/agent/status/{job_id}")
@@ -624,4 +624,3 @@ async def ping():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000)
-    
