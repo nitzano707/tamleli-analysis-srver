@@ -190,16 +190,53 @@ def extract_json(raw_text: str):
         if last_bracket > 0:
             text = text[:last_bracket + 1]
     
+    # ניסיון ראשון - פרסור רגיל
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON: {e}")
+        logger.warning(f"JSON parse error (attempt 1): {e}")
+        
+        # ניסיון שני - תיקון גרשיים
         try:
             fixed = text.replace("'", '"')
             return json.loads(fixed)
-        except:
-            pass
-        return None
+        except json.JSONDecodeError as e2:
+            logger.warning(f"JSON parse error (attempt 2): {e2}")
+            
+            # ניסיון שלישי - תיקון פסיקים חסרים לפני סוגריים סגורים
+            try:
+                # מוסיף פסיק לפני } או ] אם חסר
+                fixed2 = re.sub(r'(["\d\]\}])\s*\n\s*(["\[])', r'\1,\n\2', text)
+                fixed2 = re.sub(r'(["\d\]\}])\s*(["\[])', r'\1, \2', fixed2)
+                # מוסיף פסיק לפני } או ] בסוף אובייקט/מערך
+                fixed2 = re.sub(r'(["\d\]\}])\s*\n\s*([}\]])', r'\1\n\2', fixed2)
+                return json.loads(fixed2)
+            except json.JSONDecodeError as e3:
+                logger.warning(f"JSON parse error (attempt 3): {e3}")
+                
+                # ניסיון רביעי - תיקון מחרוזות לא סגורות
+                try:
+                    # מוצא מחרוזות לא סגורות ומסיים אותן
+                    lines = text.split('\n')
+                    fixed3_lines = []
+                    in_string = False
+                    for line in lines:
+                        # ספירת גרשיים לא מוברחים
+                        quote_count = line.count('"') - line.count('\\"')
+                        if quote_count % 2 == 1:
+                            in_string = not in_string
+                        if in_string and not line.rstrip().endswith('"') and not line.rstrip().endswith('\\'):
+                            # אם בשורה יש מחרוזת לא סגורה, נסה לסגור אותה
+                            if '"' in line:
+                                line = line.rstrip() + '"\n'
+                                in_string = False
+                        fixed3_lines.append(line)
+                    fixed3 = '\n'.join(fixed3_lines)
+                    return json.loads(fixed3)
+                except json.JSONDecodeError as e4:
+                    logger.error(f"All JSON parse attempts failed. Last error: {e4}")
+                    logger.error(f"Problematic text preview (first 1000 chars): {text[:1000]}")
+                    return None
 
 
 # ============================================================
@@ -446,10 +483,12 @@ def p_stage1_2_coding(segments: list, research_ctx: dict, chunk_num: int = 1, to
 ## משימה: שלבים 1-2 - היכרות וקידוד ראשוני
 
 ### הנחיות קריטיות:
-1. קרא את התמלול בעיון והתמקד בתוכן הרלוונטי לשאלת המחקר
-2. צור קודים סמנטיים (2-5 מילים בעברית)
-3. **חובה: לכל קוד לפחות 2-3 ציטוטים מדויקים עם חותמות זמן!**
-4. ציטוטים עשירים = ניתוח איכותי טוב
+1. **התמקד בתוכן הדברים של המרואיין בהקשר לשאלת המחקר - לא בפרופיל המרואיין!**
+2. **התעלם ממידע על הרקע המקצועי, הניסיון, או ההיכרות הראשונית של המרואיין - זה לא חלק מהניתוח התימטי**
+3. קרא את התמלול בעיון והתמקד בתוכן הרלוונטי לשאלת המחקר
+4. צור קודים סמנטיים (2-5 מילים בעברית) על בסיס התוכן והתובנות של המרואיין
+5. **חובה: לכל קוד לפחות 2-3 ציטוטים מדויקים עם חותמות זמן!**
+6. ציטוטים עשירים = ניתוח איכותי טוב
 
 ### התמלול:
 {text}
@@ -507,8 +546,10 @@ def p_stage3_4_themes(codes_data: list, research_ctx: dict) -> str:
 
 ### הנחיות קריטיות:
 1. **העבר את כל הציטוטים מהקודים לתימות!**
-2. כל תימה צריכה להיות קוהרנטית פנימית
-3. הבחנה ברורה בין תימות
+2. **התעלם מקודים הקשורים לפרופיל המרואיין, הרקע המקצועי, או היכרות ראשונית - אלה לא תימות תימטיות!**
+3. כל תימה צריכה להיות קוהרנטית פנימית ומתמקדת בתוכן הרלוונטי לשאלת המחקר
+4. הבחנה ברורה בין תימות
+5. תימות צריכות לשקף תובנות, חוויות, תפיסות או ממצאים הקשורים לשאלת המחקר - לא מידע ביוגרפי
 
 ### קודים (כולל ציטוטים):
 {json.dumps(codes_summary[:50], ensure_ascii=False, indent=2)}
@@ -554,8 +595,17 @@ def p_stage5_6_report(themes_data: list, research_ctx: dict, participant_info: s
 
 ### הנחיות קריטיות:
 1. **שמור את כל הציטוטים עם חותמות הזמן!**
-2. הגדרות אקדמיות ברורות
-3. תקציר שעונה על שאלת המחקר
+2. **ודא שהתימות מתמקדות בתוכן הרלוונטי לשאלת המחקר - לא בפרופיל המרואיין!**
+3. **הסר או התעלם מתימות הקשורות לפרופיל, רקע מקצועי, או היכרות ראשונית - אלה לא חלק מהניתוח התימטי**
+4. הגדרות אקדמיות ברורות המתמקדות בתובנות, תפיסות, חוויות או ממצאים הקשורים לשאלת המחקר
+5. תקציר שעונה על שאלת המחקר
+
+### חובה - חלקי הדו"ח שצריכים להיות מפורטים:
+- **קשרים בין תימות**: זהה ופרט כיצד התימות קשורות זו לזו, האם יש חפיפה, סתירה, או קשרים סיבתיים
+- **השלכות תיאורטיות**: מה המשמעות התיאורטית של הממצאים? איך הם תורמים להבנת התופעה הנחקרת?
+- **השלכות מעשיות**: מה המשמעות המעשית? איך ניתן ליישם את הממצאים בשטח?
+- **מגבלות**: מה המגבלות של המחקר? (גודל מדגם, הקשר, שיטה וכו')
+- **כיווני מחקר עתידיים**: מה מומלץ לחקור בהמשך?
 
 ### תימות לעיבוד:
 {json.dumps(themes_data, ensure_ascii=False, indent=2)}
@@ -582,13 +632,16 @@ def p_stage5_6_report(themes_data: list, research_ctx: dict, participant_info: s
   ],
   
   "report": {{
-    "executive_summary": "תקציר מנהלים (5-7 משפטים)",
+    "executive_summary": "תקציר מנהלים (5-7 משפטים) - חובה!",
     "methodology_note": "ניתוח תמטי - Braun & Clarke (2006)",
     "key_findings": ["ממצא 1", "ממצא 2"],
-    "theme_relationships": "קשרים בין תימות",
-    "implications": {{"theoretical": "...", "practical": "..."}},
-    "limitations": "מגבלות",
-    "future_research": "המלצות"
+    "theme_relationships": "חובה! זהה ופרט את הקשרים בין התימות: חפיפות, סתירות, קשרים סיבתיים, או היעדר קשרים. אם אין קשרים ברורים, הסבר מדוע.",
+    "implications": {{
+      "theoretical": "חובה! מה המשמעות התיאורטית של הממצאים? איך הם תורמים להבנת התופעה?",
+      "practical": "חובה! מה המשמעות המעשית? איך ניתן ליישם את הממצאים בשטח?"
+    }},
+    "limitations": "חובה! מה המגבלות של המחקר? (גודל מדגם, הקשר, שיטה, מגבלות הניתוח וכו')",
+    "future_research": "חובה! מה מומלץ לחקור בהמשך? אילו שאלות נשארו פתוחות?"
   }},
   
   "matrix": [
@@ -696,10 +749,25 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
         if not themes_defined and themes:
             logger.warning(f"themes_defined is empty but we have {len(themes)} themes from stage 3-4. Converting...")
             themes_defined = []
+            # מילות מפתח לזיהוי תימות לא רלוונטיות (פרופיל המרואיין)
+            profile_keywords = [
+                "פרופיל", "רקע מקצועי", "ניסיון", "היכרות ראשונית", "הכרות ראשונית",
+                "קורות חיים", "ביוגרפיה", "רקע אישי", "השכלה", "הכשרה מקצועית"
+            ]
+            
             for theme in themes:
                 # המרת פורמט מ-themes ל-themes_defined
                 theme_name = theme.get("theme_name") or theme.get("theme", "")
                 theme_def = theme.get("description") or theme.get("definition", "")
+                
+                # בדיקה אם התימה קשורה לפרופיל המרואיין
+                theme_text = f"{theme_name} {theme_def}".lower()
+                is_profile_theme = any(keyword in theme_text for keyword in profile_keywords)
+                
+                if is_profile_theme:
+                    logger.info(f"Filtering out profile theme: {theme_name}")
+                    continue
+                
                 codes_with_quotes = theme.get("codes_with_quotes", [])
                 
                 themes_defined.append({
@@ -710,10 +778,65 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
                     "theoretical_significance": theme.get("theoretical_significance", ""),
                     "prevalence": theme.get("prevalence", "בינונית")
                 })
-            logger.info(f"Converted {len(themes_defined)} themes from stage 3-4 format")
+            logger.info(f"Converted {len(themes_defined)} themes from stage 3-4 format (filtered profile themes)")
+        
+        # פילטר סופי: הסרת תימות פרופיל גם מתוצאות המודל
+        if themes_defined:
+            profile_keywords = [
+                "פרופיל", "רקע מקצועי", "ניסיון", "היכרות ראשונית", "הכרות ראשונית",
+                "קורות חיים", "ביוגרפיה", "רקע אישי", "השכלה", "הכשרה מקצועית"
+            ]
+            filtered_themes = []
+            for theme in themes_defined:
+                theme_name = theme.get("theme", "")
+                theme_def = theme.get("definition", "")
+                theme_text = f"{theme_name} {theme_def}".lower()
+                is_profile_theme = any(keyword in theme_text for keyword in profile_keywords)
+                
+                if is_profile_theme:
+                    logger.info(f"Filtering out profile theme from final result: {theme_name}")
+                    continue
+                filtered_themes.append(theme)
+            
+            if len(filtered_themes) < len(themes_defined):
+                logger.info(f"Filtered {len(themes_defined) - len(filtered_themes)} profile themes from final result")
+                themes_defined = filtered_themes
         
         if not report.get("executive_summary"):
             report["executive_summary"] = f"ניתוח תמטי של {len(filtered_segments)} מקטעים העלה {len(themes_defined)} תימות."
+        
+        # וידוא שכל חלקי הדו"ח קיימים - הוספת ערכי ברירת מחדל אם חסרים
+        if not report.get("theme_relationships") or report.get("theme_relationships", "").strip() in ["", "לא זוהו קשרים ספציפיים", "קשרים בין תימות"]:
+            if len(themes_defined) > 1:
+                theme_names = ", ".join([t.get("theme", "") for t in themes_defined[:3]])
+                report["theme_relationships"] = f"זוהו {len(themes_defined)} תימות מרכזיות ({theme_names} ועוד). ניתוח ראשוני מצביע על קשרים אפשריים בין התימות, אך נדרש עיבוד נוסף לזיהוי מדויק של הקשרים."
+            else:
+                report["theme_relationships"] = "זוהתה תימה מרכזית אחת. לא ניתן לזהות קשרים בין תימות מרובות."
+            logger.warning("theme_relationships was missing or empty - using default")
+        
+        if not report.get("implications"):
+            report["implications"] = {}
+        
+        if not report["implications"].get("theoretical") or report["implications"].get("theoretical", "").strip() in ["", "לא צוינו", "..."]:
+            research_q = ctx.get("research_question", "התופעה הנחקרת")
+            report["implications"]["theoretical"] = f"הממצאים תורמים להבנת {research_q}. התימות שזוהו מצביעות על דפוסים ותובנות רלוונטיות, אך נדרש עיבוד נוסף להבנת המשמעות התיאורטית המלאה."
+            logger.warning("implications.theoretical was missing or empty - using default")
+        
+        if not report["implications"].get("practical") or report["implications"].get("practical", "").strip() in ["", "לא צוינו", "..."]:
+            report["implications"]["practical"] = f"הממצאים מצביעים על תובנות מעשיות שניתן ליישם בהקשר הרלוונטי. נדרש עיבוד נוסף לזיהוי יישומים ספציפיים."
+            logger.warning("implications.practical was missing or empty - using default")
+        
+        if not report.get("limitations") or report.get("limitations", "").strip() in ["", "מגבלות"]:
+            report["limitations"] = f"המחקר מבוסס על ניתוח של {len(filtered_segments)} מקטעים מתמלול אחד. מגבלות המחקר כוללות: (1) גודל מדגם קטן - מרואיין אחד, (2) הקשר ספציפי שעשוי להגביל הכללה, (3) תלות בפרשנות המנתח, (4) מגבלות הניתוח האוטומטי."
+            logger.warning("limitations was missing or empty - using default")
+        
+        if not report.get("future_research") or report.get("future_research", "").strip() in ["", "המלצות"]:
+            research_q = ctx.get("research_question", "")
+            if research_q:
+                report["future_research"] = f"מומלץ להרחיב את המחקר על ידי בחינת שאלת המחקר '{research_q}' במדגם גדול יותר ובהקשרים מגוונים. שאלות נוספות שעלו מהניתוח: [יש להשלים בהתאם לממצאים הספציפיים]."
+            else:
+                report["future_research"] = f"מומלץ להרחיב את המחקר במדגם גדול יותר ובהקשרים מגוונים. שאלות נוספות שעלו מהניתוח: [יש להשלים בהתאם לממצאים הספציפיים]."
+            logger.warning("future_research was missing or empty - using default")
         
         update_progress(job_id, 95, "מסכם...")
         
