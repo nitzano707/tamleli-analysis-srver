@@ -37,8 +37,9 @@ MODEL_CONFIG = {
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         "max_retries": 5,
-        "base_delay": 30,
+        "base_delay": 25,
         "retry_delay": 60,
+        "max_segments_per_chunk": 35,
     },
     "gemini-pro": {
         "api_name": "gemini-1.5-pro",
@@ -46,8 +47,9 @@ MODEL_CONFIG = {
         "provider": "google",
         "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         "max_retries": 5,
-        "base_delay": 30,
+        "base_delay": 25,
         "retry_delay": 60,
+        "max_segments_per_chunk": 40,
     },
     "gpt": {
         "api_name": "gpt-4o",
@@ -57,6 +59,7 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 5,
         "retry_delay": 30,
+        "max_segments_per_chunk": 30,
     },
     "gpt-mini": {
         "api_name": "gpt-4o-mini",
@@ -66,6 +69,7 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 3,
         "retry_delay": 20,
+        "max_segments_per_chunk": 25,
     },
     "claude": {
         "api_name": "claude-sonnet-4-20250514",
@@ -75,6 +79,7 @@ MODEL_CONFIG = {
         "max_retries": 4,
         "base_delay": 5,
         "retry_delay": 30,
+        "max_segments_per_chunk": 35,
     },
     "claude-haiku": {
         "api_name": "claude-haiku-4-20250514",
@@ -84,6 +89,7 @@ MODEL_CONFIG = {
         "max_retries": 4,
         "base_delay": 3,
         "retry_delay": 20,
+        "max_segments_per_chunk": 30,
     },
 }
 
@@ -109,6 +115,7 @@ def update_progress(job_id, v, step_info=""):
         JOBS[job_id]["progress"] = int(v)
         JOBS[job_id]["step_info"] = step_info
         JOBS[job_id]["wait_until"] = None
+        JOBS[job_id]["status"] = "running"
 
 
 def set_waiting(job_id, seconds):
@@ -268,7 +275,6 @@ async def smart_api_call(func, job_id, config, *args, **kwargs):
 # ============================================================
 async def call_gpt(prompt: str, api_key: str, model_id: str = "gpt") -> str:
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gpt"])
-    
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -287,7 +293,6 @@ async def call_gpt(prompt: str, api_key: str, model_id: str = "gpt") -> str:
 
 async def call_claude(prompt: str, api_key: str, model_id: str = "claude") -> str:
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["claude"])
-    
     headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
@@ -306,23 +311,15 @@ async def call_claude(prompt: str, api_key: str, model_id: str = "claude") -> st
 
 async def call_gemini(prompt: str, api_key: str, model_id: str = "gemini") -> str:
     config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gemini"])
-    
-    url = config["url_template"].format(
-        model=config["api_name"],
-        api_key=api_key
-    )
+    url = config["url_template"].format(model=config["api_name"], api_key=api_key)
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 16000
-        }
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 16000}
     }
     async with httpx.AsyncClient(timeout=300) as client:
         r = await client.post(url, json=payload)
         r.raise_for_status()
         response = r.json()
-        
         if "candidates" in response and len(response["candidates"]) > 0:
             return response["candidates"][0]["content"]["parts"][0]["text"]
         elif "error" in response:
@@ -334,36 +331,36 @@ async def call_gemini(prompt: str, api_key: str, model_id: str = "gemini") -> st
 async def model_call(prompt: str, model: str, api_key: str, job_id: str) -> str:
     if not api_key:
         raise Exception("חסר API Key")
-    
     config = MODEL_CONFIG.get(model, MODEL_CONFIG.get("gemini"))
     provider = config["provider"]
-    
     logger.info(f"Calling {model} (provider: {provider})")
-    
     if provider == "openai":
         call_func = call_gpt
     elif provider == "anthropic":
         call_func = call_claude
     else:
         call_func = call_gemini
-    
-    return await smart_api_call(
-        call_func,
-        job_id,
-        config,
-        prompt, api_key, model
-    )
+    return await smart_api_call(call_func, job_id, config, prompt, api_key, model)
 
 
 # ============================================================
-# TRANSCRIPT EXTRACTION & FILTERING
+# TRANSCRIPT EXTRACTION & HELPERS
 # ============================================================
+def format_timestamp(seconds: float) -> str:
+    if seconds is None:
+        return ""
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
 def extract_transcript(raw):
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
-        if "versions" in raw:
-            return raw["versions"][-1].get("segments", [])
+        if "versions" in raw and isinstance(raw["versions"], list) and len(raw["versions"]) > 0:
+            latest_version = raw["versions"][-1]
+            return latest_version.get("segments", [])
         if "segments" in raw:
             return raw["segments"]
         if "utterances" in raw:
@@ -371,15 +368,16 @@ def extract_transcript(raw):
     return []
 
 
-def filter_intro_segments(segments: list) -> list:
+def filter_intro_segments(segments: list) -> tuple:
     intro_patterns = [
         r'שלום.*שמי', r'היי.*קוראים לי', r'אני.*המראיין',
         r'תודה שהסכמת', r'נתחיל.*הראיון', r'לפני שנתחיל',
         r'אני מקליט', r'בוא נתחיל', r'תספר.*על עצמך',
         r'תודה רבה על.*הראיון', r'זהו.*סיימנו', r'נסיים כאן',
+        r'ביי\s*ביי', r'להתראות', r'תודה.*עזרת',
     ]
-    
     filtered = []
+    intro_segments = []
     skip_intro = True
     
     for seg in segments:
@@ -387,322 +385,337 @@ def filter_intro_segments(segments: list) -> list:
         if not text or len(text) < 5:
             continue
         is_intro = any(re.search(p, text, re.IGNORECASE) for p in intro_patterns)
+        if is_intro:
+            intro_segments.append(seg)
+            continue
         if not is_intro and len(text) > 20:
             skip_intro = False
-        if skip_intro and (is_intro or len(text) < 15):
+        if skip_intro and len(text) < 15:
+            intro_segments.append(seg)
             continue
         filtered.append(seg)
-    
-    return filtered
+    return filtered, intro_segments
+
+
+def chunk_segments(segments: list, max_per_chunk: int) -> list:
+    if len(segments) <= max_per_chunk:
+        return [segments]
+    chunks = []
+    for i in range(0, len(segments), max_per_chunk):
+        chunks.append(segments[i:i + max_per_chunk])
+    return chunks
 
 
 # ============================================================
-# PROMPTS WITH RESEARCH CONTEXT
+# PROMPTS - 6 STAGES OF BRAUN & CLARKE
 # ============================================================
-
 def format_research_context(ctx: dict) -> str:
-    """מעצב את הקשר המחקר לתוך הפרומפט"""
     parts = []
-    
     if ctx.get("research_question"):
         parts.append(f"שאלת המחקר: {ctx['research_question']}")
-    
     if ctx.get("study_context"):
         parts.append(f"הקשר המחקר: {ctx['study_context']}")
-    
     if ctx.get("additional_notes"):
         parts.append(f"הערות נוספות: {ctx['additional_notes']}")
-    
-    if parts:
-        return "\n".join(parts)
-    return ""
+    return "\n".join(parts) if parts else ""
 
 
-def p_coding_and_themes(segments, research_ctx: dict):
-    """פרומפט משולב: סינון + קידוד + תימות ראשוניות - עם הקשר מחקר"""
-    
+def format_segments_with_timestamps(segments: list) -> str:
+    lines = []
+    for i, s in enumerate(segments):
+        start_time = format_timestamp(s.get("start", 0))
+        end_time = format_timestamp(s.get("end", 0))
+        speaker = s.get("speaker", "דובר")
+        text = s.get("text", "")
+        lines.append(f"[{i+1}] [{start_time}-{end_time}] {speaker}: \"{text}\"")
+    return "\n\n".join(lines)
+
+
+def p_stage1_2_coding(segments: list, research_ctx: dict, chunk_num: int = 1, total_chunks: int = 1) -> str:
     context_section = format_research_context(research_ctx)
+    text = format_segments_with_timestamps(segments)
+    chunk_note = f"\n*** חלק {chunk_num} מתוך {total_chunks} ***\n" if total_chunks > 1 else ""
     
-    text = "\n\n".join([
-        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')}\""
-        for i, s in enumerate(segments[:50])
-    ])
-    
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
-
-{"=" * 50}
+    return f"""אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
+{chunk_note}
+{"=" * 60}
 הקשר המחקר:
-{context_section if context_section else "לא סופק הקשר ספציפי - בצע ניתוח כללי"}
-{"=" * 50}
+{context_section if context_section else "לא סופק הקשר ספציפי"}
+{"=" * 60}
 
-קיבלת תמלול ראיון. בצע ניתוח מקיף תוך התמקדות בשאלת המחקר והקשר שסופק.
+## משימה: שלבים 1-2 - היכרות וקידוד ראשוני
 
-## הנחיות חשובות:
+### הנחיות קריטיות:
+1. קרא את התמלול בעיון והתמקד בתוכן הרלוונטי לשאלת המחקר
+2. צור קודים סמנטיים (2-5 מילים בעברית)
+3. **חובה: לכל קוד לפחות 2-3 ציטוטים מדויקים עם חותמות זמן!**
+4. ציטוטים עשירים = ניתוח איכותי טוב
 
-1. **התמקד בתוכן הרלוונטי לשאלת המחקר** - התעלם ממידע דמוגרפי, הצגות עצמיות, ושיחת חולין שאינם קשורים ישירות לנושא.
-
-2. **קידוד פתוח (Initial Coding)** - צור קודים סמנטיים (2-5 מילים) שמתארים את התוכן ביחס לשאלת המחקר.
-
-3. **תימות ראשוניות** - קבץ קודים לתימות שעונות על שאלת המחקר (3-6 תימות).
-
-4. **ציטוטים** - לכל קוד, שמור את הציטוטים הרלוונטיים מהתמלול. זה קריטי!
-
-## התמלול:
+### התמלול:
 {text}
 
-## החזר JSON בלבד במבנה הבא:
+### החזר JSON בלבד:
 {{
-  "intro_info": {{
-    "participant_description": "תיאור קצר של המרואיין (אם יש)",
-    "interview_context": "הקשר הראיון (אם רלוונטי)",
-    "excluded_content": "סוגי תוכן שהושמטו מהניתוח"
-  }},
-  "codes": [
+  "coded_segments": [
     {{
       "segment_index": 1,
-      "text": "הטקסט המלא של המקטע",
-      "codes": ["קוד 1", "קוד 2"],
-      "quotes": ["ציטוט מדויק 1", "ציטוט מדויק 2"],
-      "speaker": "דובר"
+      "timestamp": "MM:SS-MM:SS",
+      "speaker": "שם",
+      "original_text": "הטקסט המלא",
+      "codes": [
+        {{
+          "code": "שם הקוד",
+          "quotes": [
+            {{"text": "ציטוט מדויק 1", "timestamp": "MM:SS"}},
+            {{"text": "ציטוט מדויק 2", "timestamp": "MM:SS"}},
+            {{"text": "ציטוט מדויק 3", "timestamp": "MM:SS"}}
+          ]
+        }}
+      ]
     }}
   ],
-  "initial_themes": [
-    {{
-      "theme": "שם התימה",
-      "description": "תיאור קצר",
-      "codes": ["קוד 1", "קוד 2", "קוד 3"],
-      "relevance_to_research": "כיצד התימה עונה על שאלת המחקר"
-    }}
-  ]
+  "all_codes": ["רשימת כל הקודים"]
 }}
+
+**זכור: ציטוטים רבים ומדויקים הם המפתח לניתוח טוב!**
 """
 
 
-def p_define_and_report(themes, codes, segments, research_ctx: dict):
-    """פרומפט משולב: הגדרת תימות + דו"ח + מטריצה - עם הקשר מחקר"""
-    
+def p_stage3_4_themes(codes_data: list, research_ctx: dict) -> str:
     context_section = format_research_context(research_ctx)
-    participant_info = research_ctx.get("participant_info", "")
     
-    quotes_text = "\n".join([
-        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')[:300]}\""
-        for i, s in enumerate(segments[:30])
-    ])
+    codes_summary = []
+    for seg in codes_data:
+        for code_item in seg.get("codes", []):
+            codes_summary.append({
+                "code": code_item.get("code", ""),
+                "quotes": code_item.get("quotes", []),
+                "speaker": seg.get("speaker", "")
+            })
     
-    return f"""
-אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
+    return f"""אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
 
-{"=" * 50}
+{"=" * 60}
 הקשר המחקר:
-{context_section if context_section else "לא סופק הקשר ספציפי"}
+{context_section if context_section else "לא סופק הקשר"}
+{"=" * 60}
 
-מידע על המשתתפים:
-{participant_info if participant_info else "לא סופק מידע"}
-{"=" * 50}
+## משימה: שלבים 3-4 - חיפוש וסקירת תימות
 
-בצע ניתוח סופי מקיף שעונה על שאלת המחקר:
+### שלב 3: קבץ קודים לתימות ראשוניות (3-7 תימות)
+### שלב 4: סקור - בדוק קוהרנטיות, מזג/פצל לפי הצורך
 
-## תימות לעיבוד:
-{json.dumps(themes, ensure_ascii=False, indent=2)}
+### הנחיות קריטיות:
+1. **העבר את כל הציטוטים מהקודים לתימות!**
+2. כל תימה צריכה להיות קוהרנטית פנימית
+3. הבחנה ברורה בין תימות
 
-## קודים שזוהו (כולל ציטוטים):
-{json.dumps(codes[:30], ensure_ascii=False, indent=2)}
+### קודים (כולל ציטוטים):
+{json.dumps(codes_summary[:50], ensure_ascii=False, indent=2)}
 
-## מקטעים נוספים מהתמלול:
-{quotes_text}
-
-## משימות:
-
-### 1. הגדר תימות סופיות
-לכל תימה:
-- שם אקדמי ממצה
-- הגדרה מפורטת (2-3 משפטים)
-- קודים משויכים עם ציטוטים לכל קוד (חשוב מאוד!)
-- משמעות ביחס לשאלת המחקר
-
-### 2. כתוב דו"ח ממצאים
-- פסקת מבוא עם פרטי רקע על המרואיין/מחקר
-- תקציר מנהלים שעונה על שאלת המחקר
-- סקירת תימות והשלכות
-
-### 3. מטריצת קודים-ציטוטים
-לכל תימה וקוד - רשום את כל הציטוטים הרלוונטיים!
-
-## החזר JSON בלבד:
+### החזר JSON:
 {{
-  "intro_paragraph": "פסקת מבוא עם רקע על המרואיין, הקשר הראיון, ומידע רלוונטי שאינו חלק מהניתוח התמטי עצמו",
-  "themes_defined": [
+  "themes": [
     {{
-      "theme": "שם התימה האקדמי",
-      "definition": "הגדרה מפורטת (2-3 משפטים)",
-      "relevance_to_research": "כיצד התימה עונה על שאלת המחקר",
+      "theme_name": "שם התימה",
+      "description": "תיאור",
       "codes_with_quotes": [
         {{
           "code": "שם הקוד",
           "quotes": [
-            {{"text": "ציטוט מדויק 1", "speaker": "מרואיין"}},
-            {{"text": "ציטוט מדויק 2", "speaker": "מרואיין"}}
+            {{"text": "ציטוט", "timestamp": "MM:SS", "speaker": "דובר"}}
           ]
         }}
       ],
-      "theoretical_significance": "משמעות תיאורטית"
-    }}
-  ],
-  "report": {{
-    "executive_summary": "תקציר מנהלים שעונה ישירות על שאלת המחקר (4-5 משפטים)",
-    "methodology_note": "הערה מתודולוגית",
-    "themes_overview": [
-      {{
-        "theme": "שם",
-        "key_findings": "ממצאים עיקריים ביחס לשאלת המחקר",
-        "prevalence": "גבוהה/בינונית/נמוכה",
-        "significance": "משמעות"
-      }}
-    ],
-    "theme_relationships": "קשרים בין תימות",
-    "implications": {{
-      "theoretical": "השלכות תיאורטיות",
-      "practical": "השלכות מעשיות"
-    }},
-    "limitations": "מגבלות",
-    "future_research": "כיווני מחקר"
-  }},
-  "matrix": [
-    {{
-      "theme": "שם התימה",
-      "definition": "הגדרה",
-      "codes": [
-        {{
-          "code": "שם הקוד",
-          "quotes": ["ציטוט 1", "ציטוט 2", "ציטוט 3"]
-        }}
-      ],
-      "prevalence": "גבוהה",
-      "key_insight": "תובנה מרכזית"
+      "coherence_note": "הסבר למה התימה קוהרנטית"
     }}
   ]
 }}
 """
 
 
+def p_stage5_6_report(themes_data: list, research_ctx: dict, participant_info: str) -> str:
+    context_section = format_research_context(research_ctx)
+    
+    return f"""אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
+
+{"=" * 60}
+הקשר המחקר:
+{context_section if context_section else "לא סופק הקשר"}
+
+מידע על משתתפים (למבוא):
+{participant_info if participant_info else "לא סופק"}
+{"=" * 60}
+
+## משימה: שלבים 5-6 - הגדרת תימות ודו"ח סופי
+
+### שלב 5: הגדר כל תימה סופית עם שם אקדמי והגדרה מדויקת
+### שלב 6: כתוב דו"ח מקיף
+
+### הנחיות קריטיות:
+1. **שמור את כל הציטוטים עם חותמות הזמן!**
+2. הגדרות אקדמיות ברורות
+3. תקציר שעונה על שאלת המחקר
+
+### תימות לעיבוד:
+{json.dumps(themes_data, ensure_ascii=False, indent=2)}
+
+### החזר JSON מלא:
+{{
+  "intro_paragraph": "פסקת מבוא עם רקע על המרואיין והקשר",
+  
+  "themes_defined": [
+    {{
+      "theme": "שם התימה הסופי",
+      "definition": "הגדרה אקדמית (2-3 משפטים)",
+      "codes_with_quotes": [
+        {{
+          "code": "שם הקוד",
+          "quotes": [
+            {{"text": "ציטוט מדויק", "timestamp": "MM:SS", "speaker": "דובר"}}
+          ]
+        }}
+      ],
+      "relevance_to_research": "קשר לשאלת המחקר",
+      "theoretical_significance": "משמעות תיאורטית"
+    }}
+  ],
+  
+  "report": {{
+    "executive_summary": "תקציר מנהלים (5-7 משפטים)",
+    "methodology_note": "ניתוח תמטי - Braun & Clarke (2006)",
+    "key_findings": ["ממצא 1", "ממצא 2"],
+    "theme_relationships": "קשרים בין תימות",
+    "implications": {{"theoretical": "...", "practical": "..."}},
+    "limitations": "מגבלות",
+    "future_research": "המלצות"
+  }},
+  
+  "matrix": [
+    {{
+      "theme": "שם",
+      "definition": "הגדרה",
+      "codes_list": ["קוד1", "קוד2"],
+      "total_quotes": 10,
+      "prevalence": "גבוהה/בינונית/נמוכה"
+    }}
+  ]
+}}
+
+**חשוב: וודא שכל הציטוטים נשמרים עם חותמות זמן!**
+"""
+
+
 # ============================================================
-# OPTIMIZED PIPELINE
+# MAIN PIPELINE
 # ============================================================
 async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
     try:
-        # Get model display name
         model_config = MODEL_CONFIG.get(model, MODEL_CONFIG["gemini"])
         model_display_name = model_config.get("display_name", model)
+        max_segments = model_config.get("max_segments_per_chunk", 35)
         
-        # Normalize research context
-        if isinstance(research_ctx, dict):
-            ctx = research_ctx
-        else:
-            ctx = {}
+        ctx = research_ctx if isinstance(research_ctx, dict) else {}
         
-        update_progress(job_id, 5, "טוען תמלול...")
+        update_progress(job_id, 2, "טוען תמלול...")
         segments = extract_transcript(transcript_raw)
         
         if not segments:
             raise Exception("לא נמצאו מקטעים בתמלול")
         
-        logger.info(f"Starting analysis with {len(segments)} segments, model: {model}")
-        logger.info(f"Research context: {ctx.get('research_question', 'None')[:100]}")
-
-        update_progress(job_id, 10, "מסנן תוכן...")
-        segments = filter_intro_segments(segments)
-        logger.info(f"After filtering: {len(segments)} segments")
-
-        if len(segments) == 0:
-            raise Exception("לא נשאר תוכן לניתוח לאחר סינון")
-
-        # ========== קריאה 1 ==========
-        update_progress(job_id, 20, "שלב 1/2: קידוד וזיהוי תימות ראשוניות...")
-        logger.info("Step 1: Coding and Initial Themes")
+        logger.info(f"Loaded {len(segments)} segments")
         
-        raw1 = await model_call(p_coding_and_themes(segments, ctx), model, api_key, job_id)
-        result1 = extract_json(raw1)
+        update_progress(job_id, 5, "מסנן...")
+        filtered_segments, intro_segments = filter_intro_segments(segments)
         
-        if not result1:
-            logger.error("Failed to parse step 1 result")
-            result1 = {
-                "intro_info": {},
-                "codes": [{"segment_index": i+1, "text": s.get("text", "")[:100], "codes": ["קוד כללי"], "quotes": [s.get("text", "")[:100]], "speaker": s.get("speaker", "")} 
-                         for i, s in enumerate(segments[:20])],
-                "initial_themes": [{"theme": "תימה כללית", "description": "תימה שזוהתה בניתוח", "codes": ["קוד כללי"], "relevance_to_research": ""}]
-            }
+        if not filtered_segments:
+            raise Exception("לא נשאר תוכן לניתוח")
         
-        intro_info = result1.get("intro_info", {})
-        codes = result1.get("codes", [])
-        themes_initial = result1.get("initial_themes", [])
+        logger.info(f"Filtered: {len(filtered_segments)} segments")
         
-        logger.info(f"Found {len(codes)} coded segments, {len(themes_initial)} initial themes")
-        update_progress(job_id, 50, "שלב 1 הושלם...")
-
-        # ========== קריאה 2 ==========
-        update_progress(job_id, 55, "שלב 2/2: הגדרת תימות ודו\"ח...")
-        logger.info("Step 2: Define, Report and Matrix")
+        chunks = chunk_segments(filtered_segments, max_segments)
+        total_chunks = len(chunks)
+        logger.info(f"Chunks: {total_chunks}")
         
-        raw2 = await model_call(p_define_and_report(themes_initial, codes, segments, ctx), model, api_key, job_id)
+        # === קריאה 1: שלבים 1-2 ===
+        all_coded = []
+        all_codes = []
+        
+        for idx, chunk in enumerate(chunks):
+            progress = 10 + (idx * 25 // total_chunks)
+            update_progress(job_id, progress, f"שלבים 1-2: קידוד ({idx+1}/{total_chunks})...")
+            
+            raw = await model_call(p_stage1_2_coding(chunk, ctx, idx+1, total_chunks), model, api_key, job_id)
+            result = extract_json(raw)
+            
+            if result:
+                all_coded.extend(result.get("coded_segments", []))
+                all_codes.extend(result.get("all_codes", []))
+        
+        all_codes = list(set(all_codes))
+        logger.info(f"Coded: {len(all_coded)} segments, {len(all_codes)} codes")
+        update_progress(job_id, 40, "שלבים 1-2 הושלמו...")
+        
+        # === קריאה 2: שלבים 3-4 ===
+        update_progress(job_id, 45, "שלבים 3-4: תימות וסקירה...")
+        
+        raw2 = await model_call(p_stage3_4_themes(all_coded, ctx), model, api_key, job_id)
         result2 = extract_json(raw2)
         
-        if not result2:
-            logger.error("Failed to parse step 2 result")
-            result2 = {
-                "intro_paragraph": "",
-                "themes_defined": [
-                    {
-                        "theme": t.get("theme", "תימה"),
-                        "definition": t.get("description", ""),
-                        "relevance_to_research": t.get("relevance_to_research", ""),
-                        "codes_with_quotes": [{"code": c, "quotes": []} for c in t.get("codes", [])],
-                        "theoretical_significance": ""
-                    }
-                    for t in themes_initial
-                ],
-                "report": {
-                    "executive_summary": f"נותחו {len(segments)} מקטעים וזוהו {len(themes_initial)} תימות.",
-                    "methodology_note": "ניתוח תמטי לפי Braun & Clarke (2006)",
-                    "themes_overview": [],
-                    "theme_relationships": "",
-                    "implications": {"theoretical": "", "practical": ""},
-                    "limitations": "",
-                    "future_research": ""
-                },
-                "matrix": []
-            }
-
-        update_progress(job_id, 95, "מסכם תוצאות...")
-
-        themes_defined = result2.get("themes_defined", [])
-        report = result2.get("report", {})
-        matrix = result2.get("matrix", [])
-        intro_paragraph = result2.get("intro_paragraph", "")
+        themes = result2.get("themes", []) if result2 else []
+        logger.info(f"Themes: {len(themes)}")
+        update_progress(job_id, 65, "שלבים 3-4 הושלמו...")
+        
+        # === קריאה 3: שלבים 5-6 ===
+        update_progress(job_id, 70, "שלבים 5-6: הגדרות ודו\"ח...")
+        
+        raw3 = await model_call(p_stage5_6_report(themes, ctx, ctx.get("participant_info", "")), model, api_key, job_id)
+        result3 = extract_json(raw3)
+        
+        intro_paragraph = ""
+        themes_defined = []
+        report = {}
+        matrix = []
+        
+        if result3:
+            intro_paragraph = result3.get("intro_paragraph", "")
+            themes_defined = result3.get("themes_defined", [])
+            report = result3.get("report", {})
+            matrix = result3.get("matrix", [])
         
         if not report.get("executive_summary"):
-            report["executive_summary"] = f"ניתוח תמטי של {len(segments)} מקטעים העלה {len(themes_defined)} תימות מרכזיות."
+            report["executive_summary"] = f"ניתוח תמטי של {len(filtered_segments)} מקטעים העלה {len(themes_defined)} תימות."
+        
+        update_progress(job_id, 95, "מסכם...")
+        
+        total_quotes = sum(
+            len(q.get("quotes", []))
+            for t in themes_defined
+            for q in t.get("codes_with_quotes", [])
+        )
         
         stats = {
-            "total_segments": len(segments),
-            "total_codes": sum(len(c.get("codes", [])) for c in codes),
+            "total_segments": len(filtered_segments),
+            "total_codes": len(all_codes),
             "total_themes": len(themes_defined),
+            "total_quotes": total_quotes,
             "analysis_model": model,
             "model_display_name": model_display_name,
-            "api_calls": 2,
-            "analysis_date": time.strftime("%Y-%m-%d %H:%M")
+            "api_calls": 2 + total_chunks,
+            "analysis_date": time.strftime("%Y-%m-%d %H:%M"),
+            "methodology": "Braun & Clarke (2006) - 6 שלבים"
         }
         
-        logger.info(f"Pipeline completed: {stats}")
+        logger.info(f"Done: {stats}")
         
         return {
             "statistics": stats,
             "research_context": ctx,
             "intro_paragraph": intro_paragraph,
-            "intro_info": intro_info,
-            "clean_transcript": segments,
-            "codes": codes,
-            "themes_initial": themes_initial,
+            "clean_transcript": filtered_segments,
+            "coded_segments": all_coded,
+            "all_codes": all_codes,
+            "themes": themes,
             "themes_defined": themes_defined,
             "report": report,
             "matrix": matrix
@@ -713,11 +726,8 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
         raise
 
 
-# ============================================================
-# BACKGROUND RUNNER
-# ============================================================
 async def background_run(job_id, transcript, ctx, model, api_key):
-    logger.info(f"Background task started for job {job_id}")
+    logger.info(f"Job {job_id} started")
     try:
         result = await run_pipeline(job_id, transcript, ctx, model, api_key)
         set_result(job_id, result)
@@ -729,37 +739,26 @@ async def background_run(job_id, transcript, ctx, model, api_key):
 # ============================================================
 # API ENDPOINTS
 # ============================================================
-
-
 @app.post("/agent/analyze")
 async def analyze(req: AnalysisRequest):
     job_id = str(uuid.uuid4())
     create_job(job_id)
-    
-    # Convert research_context to dict if needed
     ctx = req.research_context
     if hasattr(ctx, 'dict'):
         ctx = ctx.dict()
     elif not isinstance(ctx, dict):
         ctx = {}
-    
-    asyncio.create_task(
-        background_run(job_id, req.transcript, ctx, req.model, req.api_key)
-    )
-    
+    asyncio.create_task(background_run(job_id, req.transcript, ctx, req.model, req.api_key))
     return {"job_id": job_id, "status": "running"}
 
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
     job = JOBS.get(job_id, {"error": "not found"})
-    
     if job.get("wait_until"):
-        remaining = max(0, int(job["wait_until"] - time.time()))
-        job["wait_remaining"] = remaining
+        job["wait_remaining"] = max(0, int(job["wait_until"] - time.time()))
     else:
         job["wait_remaining"] = 0
-    
     return job
 
 
@@ -767,20 +766,18 @@ async def status(job_id: str):
 async def ping():
     return {"status": "ok"}
 
+
 @app.head("/ping")
 async def ping_head():
-    # UptimeRobot שולח בקשת HEAD – מחזירים 200 בלי body
     return Response(status_code=200)
 
 
 @app.get("/models")
 async def get_models():
-    return {
-        "models": [
-            {"id": mid, "name": cfg["api_name"], "display_name": cfg["display_name"], "provider": cfg["provider"]}
-            for mid, cfg in MODEL_CONFIG.items()
-        ]
-    }
+    return {"models": [
+        {"id": mid, "name": cfg["api_name"], "display_name": cfg["display_name"], "provider": cfg["provider"]}
+        for mid, cfg in MODEL_CONFIG.items()
+    ]}
 
 
 if __name__ == "__main__":
