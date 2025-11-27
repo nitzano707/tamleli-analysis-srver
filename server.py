@@ -69,6 +69,18 @@ MODEL_CONFIG = {
         "retry_delay": 30,
         "max_segments_per_chunk": 50,  # יכול לטפל ביותר מקטעים בגלל חלון הקלט הגדול
     },
+    "gemini-2.5-lite": {
+        "api_name": "gemini-2.5-flash-lite",
+        "display_name": "Gemini 2.5 Flash-Lite",
+        "provider": "google",
+        "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "max_retries": 5,
+        # הגבלות קצב: 4,000 RPM - גבוה מאוד! לא צריך RPM tracking מורכב
+        "rpm_limit": 3800,  # שמרני - מעט מתחת למגבלה
+        "base_delay": 0.015,  # ~15ms בין קריאות (מתאים ל-4000 RPM)
+        "retry_delay": 30,
+        "max_segments_per_chunk": 50,  # יכול לטפל ביותר מקטעים בגלל חלון הקלט הגדול
+    },
     "gpt": {
         "api_name": "gpt-4o",
         "display_name": "GPT-4o",
@@ -88,6 +100,16 @@ MODEL_CONFIG = {
         "base_delay": 3,
         "retry_delay": 20,
         "max_segments_per_chunk": 25,
+    },
+    "gpt-5.1": {
+        "api_name": "gpt-5.1",
+        "display_name": "GPT-5.1",
+        "provider": "openai",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "max_retries": 5,
+        "base_delay": 5,
+        "retry_delay": 30,
+        "max_segments_per_chunk": 35,
     },
     "claude": {
         "api_name": "claude-sonnet-4-20250514",
