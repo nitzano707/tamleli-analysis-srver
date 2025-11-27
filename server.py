@@ -100,6 +100,7 @@ JOBS = {}
 
 
 def create_job(job_id):
+    """יוצר job חדש או מאפס job קיים"""
     JOBS[job_id] = {
         "status": "running",
         "progress": 0,
@@ -111,26 +112,31 @@ def create_job(job_id):
 
 
 def update_progress(job_id, v, step_info=""):
-    if job_id in JOBS:
-        JOBS[job_id]["progress"] = int(v)
-        JOBS[job_id]["step_info"] = step_info
-        JOBS[job_id]["wait_until"] = None
+    if job_id not in JOBS:
+        create_job(job_id)
+    JOBS[job_id]["progress"] = int(v)
+    JOBS[job_id]["step_info"] = step_info
+    JOBS[job_id]["wait_until"] = None
 
 
 def set_waiting(job_id, seconds):
-    if job_id in JOBS:
-        JOBS[job_id]["status"] = "waiting"
-        JOBS[job_id]["wait_until"] = time.time() + seconds
-        JOBS[job_id]["step_info"] = f"ממתין {seconds} שניות בגלל הגבלת קריאות..."
+    if job_id not in JOBS:
+        create_job(job_id)
+    JOBS[job_id]["status"] = "waiting"
+    JOBS[job_id]["wait_until"] = time.time() + seconds
+    JOBS[job_id]["step_info"] = f"ממתין {seconds} שניות בגלל הגבלת קריאות..."
 
 
 def set_running(job_id):
-    if job_id in JOBS:
-        JOBS[job_id]["status"] = "running"
-        JOBS[job_id]["wait_until"] = None
+    if job_id not in JOBS:
+        create_job(job_id)
+    JOBS[job_id]["status"] = "running"
+    JOBS[job_id]["wait_until"] = None
 
 
 def set_result(job_id, r):
+    if job_id not in JOBS:
+        create_job(job_id)
     JOBS[job_id]["status"] = "done"
     JOBS[job_id]["progress"] = 100
     JOBS[job_id]["result"] = r
@@ -138,6 +144,8 @@ def set_result(job_id, r):
 
 
 def set_error(job_id, err):
+    if job_id not in JOBS:
+        create_job(job_id)
     JOBS[job_id]["status"] = "error"
     JOBS[job_id]["error"] = str(err)
     JOBS[job_id]["wait_until"] = None
@@ -945,10 +953,19 @@ def ensure_quotes_in_matrix(matrix, themes_defined):
 async def background_run(job_id, transcript, ctx, model, api_key):
     logger.info(f"Background task started for job {job_id}")
     try:
+        # Validate inputs
+        if not transcript:
+            raise Exception("תמלול חסר")
+        if not api_key:
+            raise Exception("API Key חסר")
+        if not model:
+            model = "gemini"
+        
         result = await run_pipeline(job_id, transcript, ctx, model, api_key)
         set_result(job_id, result)
+        logger.info(f"Job {job_id} completed successfully")
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}")
+        logger.error(f"Job {job_id} failed: {e}", exc_info=True)
         set_error(job_id, str(e))
 
 
@@ -957,33 +974,48 @@ async def background_run(job_id, transcript, ctx, model, api_key):
 # ============================================================
 @app.post("/agent/analyze")
 async def analyze(req: AnalysisRequest):
-    job_id = str(uuid.uuid4())
-    create_job(job_id)
-    
-    ctx = req.research_context
-    if hasattr(ctx, 'dict'):
-        ctx = ctx.dict()
-    elif not isinstance(ctx, dict):
-        ctx = {}
-    
-    asyncio.create_task(
-        background_run(job_id, req.transcript, ctx, req.model, req.api_key)
-    )
-    
-    return {"job_id": job_id, "status": "running"}
+    try:
+        # Validate request
+        if not req.transcript:
+            return {"error": "תמלול חסר", "status": "error"}
+        
+        if not req.api_key:
+            return {"error": "API Key חסר", "status": "error"}
+        
+        job_id = str(uuid.uuid4())
+        create_job(job_id)
+        
+        ctx = req.research_context
+        if hasattr(ctx, 'dict'):
+            ctx = ctx.dict()
+        elif not isinstance(ctx, dict):
+            ctx = {}
+        
+        asyncio.create_task(
+            background_run(job_id, req.transcript, ctx, req.model, req.api_key)
+        )
+        
+        return {"job_id": job_id, "status": "running"}
+    except Exception as e:
+        logger.error(f"Error in analyze endpoint: {e}")
+        return {"error": str(e), "status": "error"}
 
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    job = JOBS.get(job_id, {"error": "not found"})
-    
-    if job.get("wait_until"):
-        remaining = max(0, int(job["wait_until"] - time.time()))
-        job["wait_remaining"] = remaining
-    else:
-        job["wait_remaining"] = 0
-    
-    return job
+    try:
+        job = JOBS.get(job_id, {"error": "not found", "status": "error"})
+        
+        if job.get("wait_until"):
+            remaining = max(0, int(job["wait_until"] - time.time()))
+            job["wait_remaining"] = remaining
+        else:
+            job["wait_remaining"] = 0
+        
+        return job
+    except Exception as e:
+        logger.error(f"Error getting status for {job_id}: {e}")
+        return {"error": str(e), "status": "error"}
 
 
 @app.get("/ping")
