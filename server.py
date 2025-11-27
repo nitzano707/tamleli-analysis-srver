@@ -19,13 +19,26 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Qualitative Analysis Agent - Braun & Clarke")
 
+# CORS middleware - must be added before routes
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
 )
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return Response(
+        content=json.dumps({"error": str(exc), "status": "error"}),
+        status_code=500,
+        media_type="application/json",
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 # ============================================================
 # MODEL CONFIGURATIONS (נובמבר 2025)
@@ -1004,6 +1017,9 @@ async def analyze(req: AnalysisRequest):
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
     try:
+        if not job_id:
+            return {"error": "job_id is required", "status": "error"}
+        
         job = JOBS.get(job_id, {"error": "not found", "status": "error"})
         
         if job.get("wait_until"):
@@ -1012,19 +1028,33 @@ async def status(job_id: str):
         else:
             job["wait_remaining"] = 0
         
+        # Ensure response has CORS headers
         return job
     except Exception as e:
-        logger.error(f"Error getting status for {job_id}: {e}")
+        logger.error(f"Error getting status for {job_id}: {e}", exc_info=True)
         return {"error": str(e), "status": "error"}
 
 
 @app.get("/ping")
 async def ping():
-    return {"status": "ok"}
+    """Health check endpoint"""
+    try:
+        return {"status": "ok", "timestamp": time.time()}
+    except Exception as e:
+        logger.error(f"Error in ping: {e}")
+        return {"status": "error", "error": str(e)}
+
 @app.head("/ping")
 async def ping_head():
-    # UptimeRobot שולח בקשת HEAD – מחזירים 200 בלי body
-    return Response(status_code=200)
+    """Health check endpoint for UptimeRobot"""
+    try:
+        return Response(
+            status_code=200,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        logger.error(f"Error in ping_head: {e}")
+        return Response(status_code=500)
 
 
 
