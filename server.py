@@ -672,6 +672,15 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
         raw3 = await model_call(p_stage5_6_report(themes, ctx, ctx.get("participant_info", "")), model, api_key, job_id)
         result3 = extract_json(raw3)
         
+        # לוגים לדיבוג
+        if not result3:
+            logger.warning(f"Stage 5-6: Failed to extract JSON from raw3. Raw length: {len(raw3) if raw3 else 0}")
+            if raw3:
+                logger.warning(f"Raw3 preview: {raw3[:500]}")
+        else:
+            logger.info(f"Stage 5-6: Extracted JSON successfully. Keys: {list(result3.keys())}")
+            logger.info(f"Stage 5-6: themes_defined count: {len(result3.get('themes_defined', []))}")
+        
         intro_paragraph = ""
         themes_defined = []
         report = {}
@@ -682,6 +691,26 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
             themes_defined = result3.get("themes_defined", [])
             report = result3.get("report", {})
             matrix = result3.get("matrix", [])
+        
+        # גיבוי: אם themes_defined ריק אבל יש themes מהשלב הקודם, נמיר אותם
+        if not themes_defined and themes:
+            logger.warning(f"themes_defined is empty but we have {len(themes)} themes from stage 3-4. Converting...")
+            themes_defined = []
+            for theme in themes:
+                # המרת פורמט מ-themes ל-themes_defined
+                theme_name = theme.get("theme_name") or theme.get("theme", "")
+                theme_def = theme.get("description") or theme.get("definition", "")
+                codes_with_quotes = theme.get("codes_with_quotes", [])
+                
+                themes_defined.append({
+                    "theme": theme_name,
+                    "definition": theme_def or f"תימה: {theme_name}",
+                    "codes_with_quotes": codes_with_quotes,
+                    "relevance_to_research": theme.get("relevance_to_research", ""),
+                    "theoretical_significance": theme.get("theoretical_significance", ""),
+                    "prevalence": theme.get("prevalence", "בינונית")
+                })
+            logger.info(f"Converted {len(themes_defined)} themes from stage 3-4 format")
         
         if not report.get("executive_summary"):
             report["executive_summary"] = f"ניתוח תמטי של {len(filtered_segments)} מקטעים העלה {len(themes_defined)} תימות."
