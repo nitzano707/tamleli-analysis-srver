@@ -3,6 +3,7 @@ import json
 import asyncio
 import re
 import logging
+import time
 from typing import Union, Optional
 
 from fastapi import FastAPI, BackgroundTasks
@@ -25,6 +26,64 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================
+# MODEL CONFIGURATIONS (נובמבר 2025)
+# ============================================================
+MODEL_CONFIG = {
+    # Google Gemini - מעודכן!
+    "gemini": {
+        "api_name": "gemini-2.0-flash",
+        "provider": "google",
+        "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "max_retries": 3,
+        "retry_delay": 2,
+    },
+    "gemini-pro": {
+        "api_name": "gemini-1.5-pro",
+        "provider": "google",
+        "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "max_retries": 3,
+        "retry_delay": 2,
+    },
+    "gemini-flash": {
+        "api_name": "gemini-1.5-flash",
+        "provider": "google",
+        "url_template": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        "max_retries": 3,
+        "retry_delay": 2,
+    },
+    # OpenAI - מעודכן!
+    "gpt": {
+        "api_name": "gpt-4o",
+        "provider": "openai",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "max_retries": 5,
+        "retry_delay": 5,
+    },
+    "gpt-mini": {
+        "api_name": "gpt-4o-mini",
+        "provider": "openai",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "max_retries": 5,
+        "retry_delay": 3,
+    },
+    # Anthropic Claude - מעודכן!
+    "claude": {
+        "api_name": "claude-sonnet-4-20250514",
+        "provider": "anthropic",
+        "url": "https://api.anthropic.com/v1/messages",
+        "max_retries": 3,
+        "retry_delay": 2,
+    },
+    "claude-haiku": {
+        "api_name": "claude-haiku-4-20250514",
+        "provider": "anthropic",
+        "url": "https://api.anthropic.com/v1/messages",
+        "max_retries": 3,
+        "retry_delay": 2,
+    },
+}
 
 # ============================================================
 # JOB STORE
@@ -93,72 +152,167 @@ def extract_json(raw_text: str):
 
 
 # ============================================================
+# RETRY DECORATOR FOR RATE LIMITS
+# ============================================================
+async def retry_with_backoff(func, max_retries=3, base_delay=2, *args, **kwargs):
+    """
+    מבצע retry עם exponential backoff עבור שגיאות rate limit
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except httpx.HTTPStatusError as e:
+            last_exception = e
+            status_code = e.response.status_code
+            
+            # Rate limit error (429) or server overload (503)
+            if status_code in [429, 503]:
+                wait_time = base_delay * (2 ** attempt)  # Exponential backoff
+                
+                # Check for Retry-After header
+                retry_after = e.response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = max(wait_time, int(retry_after))
+                    except ValueError:
+                        pass
+                
+                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                # For other HTTP errors, don't retry
+                raise
+        except Exception as e:
+            last_exception = e
+            logger.error(f"Unexpected error (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(base_delay)
+            else:
+                raise
+    
+    raise last_exception
+
+
+# ============================================================
 # AI PROVIDERS
 # ============================================================
-async def call_gpt(prompt: str, api_key: str) -> str:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    body = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-    }
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=body,
-        )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-
-async def call_claude(prompt: str, api_key: str) -> str:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 8000,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=body,
-        )
-    r.raise_for_status()
-    return r.json()["content"][0]["text"]
-
-
-async def call_gemini(prompt: str, api_key: str) -> str:
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        "v1beta/models/gemini-1.5-pro:generateContent"
-        f"?key={api_key}"
+async def call_gpt(prompt: str, api_key: str, model_id: str = "gpt") -> str:
+    """קריאה ל-OpenAI GPT עם retry logic"""
+    config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gpt"])
+    
+    async def _make_request():
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "model": config["api_name"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 8000,
+        }
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(config["url"], headers=headers, json=body)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+    
+    return await retry_with_backoff(
+        _make_request, 
+        max_retries=config["max_retries"],
+        base_delay=config["retry_delay"]
     )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8000}
-    }
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(url, json=payload)
-    r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def call_claude(prompt: str, api_key: str, model_id: str = "claude") -> str:
+    """קריאה ל-Anthropic Claude עם retry logic"""
+    config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["claude"])
+    
+    async def _make_request():
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": config["api_name"],
+            "max_tokens": 8000,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(config["url"], headers=headers, json=body)
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+    
+    return await retry_with_backoff(
+        _make_request,
+        max_retries=config["max_retries"],
+        base_delay=config["retry_delay"]
+    )
+
+
+async def call_gemini(prompt: str, api_key: str, model_id: str = "gemini") -> str:
+    """קריאה ל-Google Gemini עם retry logic"""
+    config = MODEL_CONFIG.get(model_id, MODEL_CONFIG["gemini"])
+    
+    async def _make_request():
+        url = config["url_template"].format(
+            model=config["api_name"],
+            api_key=api_key
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 8000
+            }
+        }
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            response = r.json()
+            
+            # Handle different response formats
+            if "candidates" in response:
+                return response["candidates"][0]["content"]["parts"][0]["text"]
+            elif "error" in response:
+                raise Exception(f"Gemini API error: {response['error'].get('message', 'Unknown error')}")
+            else:
+                raise Exception(f"Unexpected Gemini response format: {response}")
+    
+    return await retry_with_backoff(
+        _make_request,
+        max_retries=config["max_retries"],
+        base_delay=config["retry_delay"]
+    )
 
 
 async def model_call(prompt: str, model: str, api_key: str) -> str:
+    """קריאה למודל AI לפי בחירה"""
     if not api_key:
         raise Exception("חסר API Key")
     
-    if model == "gpt":
-        return await call_gpt(prompt, api_key)
-    elif model == "claude":
-        return await call_claude(prompt, api_key)
+    # Determine provider from model ID
+    if model in MODEL_CONFIG:
+        provider = MODEL_CONFIG[model]["provider"]
     else:
-        return await call_gemini(prompt, api_key)
+        # Default mapping for backward compatibility
+        if "gpt" in model.lower():
+            provider = "openai"
+        elif "claude" in model.lower():
+            provider = "anthropic"
+        else:
+            provider = "google"
+    
+    logger.info(f"Calling {model} (provider: {provider})")
+    
+    if provider == "openai":
+        return await call_gpt(prompt, api_key, model)
+    elif provider == "anthropic":
+        return await call_claude(prompt, api_key, model)
+    else:
+        return await call_gemini(prompt, api_key, model)
 
 
 # ============================================================
@@ -180,10 +334,7 @@ def extract_transcript(raw):
 
 def filter_intro_segments(segments: list) -> list:
     """
-    מסנן מקטעים שאינם חלק מתוכן הראיון עצמו:
-    - הצגות עצמיות
-    - פתיחות טכניות
-    - סגירות
+    מסנן מקטעים שאינם חלק מתוכן הראיון עצמו
     """
     intro_patterns = [
         r'שלום.*שמי',
@@ -210,37 +361,28 @@ def filter_intro_segments(segments: list) -> list:
     ]
     
     filtered = []
-    skip_intro = True  # מדלג על פתיחות
+    skip_intro = True
     
     for seg in segments:
         text = seg.get("text", "").strip()
         if not text:
             continue
-            
-        # בדיקה אם זה מקטע פתיחה/סגירה
         is_intro = any(re.search(p, text, re.IGNORECASE) for p in intro_patterns)
-        
-        # אם מצאנו תוכן ממשי, מפסיקים לדלג
         if not is_intro and len(text) > 20:
             skip_intro = False
-        
         if skip_intro and is_intro:
             continue
-            
-        # מדלג על משפטים קצרים מאוד בהתחלה
         if skip_intro and len(text) < 15:
             continue
-            
         filtered.append(seg)
     
     return filtered
 
 
 # ============================================================
-# PROMPTS - Braun & Clarke (משופרים)
+# PROMPTS - Braun & Clarke
 # ============================================================
 def p_filter_content(segments):
-    """פרומפט לסינון תוכן לא רלוונטי"""
     text = json.dumps(segments, ensure_ascii=False)
     return f"""
 אתה מנתח מחקר איכותני מומחה.
@@ -263,13 +405,12 @@ def p_filter_content(segments):
 התמלול:
 {text}
 
-החזר JSON בלבד - מערך של המקטעים הרלוונטיים בלבד, באותו פורמט:
+החזר JSON בלבד - מערך של המקטעים הרלוונטיים בלבד:
 [{{"speaker": "...", "text": "...", "start": ..., "end": ...}}]
 """
 
 
 def p_initial_coding(segments):
-    """קידוד פתוח"""
     text = "\n\n".join([
         f"[מקטע {i+1}] {s.get('speaker', 'דובר')}:\n\"{s.get('text', '')}\""
         for i, s in enumerate(segments)
@@ -282,9 +423,10 @@ def p_initial_coding(segments):
 
 כללים:
 - קודים צריכים להיות תמציתיים (2-5 מילים)
-- קודים צריכים לשקף את תוכן הדברים, לא רק לתאר
-- זהה גם קודים תיאוריים וגם קודים פרשניים
-- התעלם ממקטעים טכניים או חסרי תוכן
+- קודים צריכים להיות בעברית
+- זהה לפחות 2-4 קודים למקטע משמעותי
+- השתמש בשפה של המרואיין כשאפשר
+- הימנע מפרשנות מוקדמת
 
 התמלול:
 {text}
@@ -293,53 +435,49 @@ def p_initial_coding(segments):
 [
   {{
     "segment_index": 1,
-    "speaker": "מרואיין",
     "text": "הטקסט המקורי",
-    "codes": ["קוד 1", "קוד 2", "קוד 3"]
+    "codes": ["קוד 1", "קוד 2", "קוד 3"],
+    "memo": "הערה קצרה (אופציונלי)"
   }}
 ]
 """
 
 
 def p_initial_themes(codes):
-    """יצירת תימות ראשוניות"""
     return f"""
 אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
 
-על בסיס הקודים הבאים, צור תימות ראשוניות (Initial Themes).
-קבץ קודים דומים לתימות רחבות יותר.
+בצע קיבוץ קודים לתימות ראשוניות (Searching for Themes).
+חפש דפוסים וקשרים בין הקודים.
 
 כללים:
-- כל תימה צריכה לכלול לפחות 2-3 קודים קשורים
-- תימות צריכות להיות משמעותיות ולא טריוויאליות
-- הוסף תיאור קצר לכל תימה
-- ציין את הקודים השייכים לכל תימה
+- תימה צריכה לאגד קודים בעלי משמעות משותפת
+- כל תימה צריכה שם ברור ותיאור קצר
+- תימה טובה מספרת "סיפור" קוהרנטי
 
-הקודים:
+קודים מהניתוח:
 {json.dumps(codes, ensure_ascii=False, indent=2)}
 
 החזר JSON בלבד:
 [
   {{
     "theme": "שם התימה",
-    "description": "תיאור קצר של התימה",
+    "description": "תיאור קצר (משפט אחד)",
     "codes": ["קוד 1", "קוד 2"],
-    "frequency": 5
+    "potential_subthemes": ["תת-תימה אפשרית"]
   }}
 ]
 """
 
 
 def p_review_themes(themes, codes):
-    """סקירה וחידוד תימות"""
     return f"""
 אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
 
-בצע סקירה וחידוד של התימות (Reviewing Themes).
-
+בצע סקירת תימות (Reviewing Themes).
 בדוק:
-1. האם כל תימה מגובשת פנימית?
-2. האם התימות נבדלות זו מזו מספיק?
+1. האם כל תימה קוהרנטית פנימית?
+2. האם יש הבחנה ברורה בין תימות?
 3. האם יש תימות שכדאי למזג?
 4. האם יש תימות שכדאי לפצל?
 5. האם כל הקודים משויכים נכון?
@@ -356,14 +494,13 @@ def p_review_themes(themes, codes):
     "theme": "שם מחודד",
     "description": "תיאור מעודכן",
     "codes": ["קוד 1", "קוד 2"],
-    "rationale": "הסבר קצר לשינויים שבוצעו"
+    "rationale": "הסבר קצר לשינויים"
   }}
 ]
 """
 
 
 def p_define_themes(themes, segments):
-    """הגדרה סופית של תימות עם ציטוטים"""
     return f"""
 אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
 
@@ -384,7 +521,7 @@ def p_define_themes(themes, segments):
 [
   {{
     "theme": "שם סופי אקדמי",
-    "definition": "הגדרה אקדמית מפורטת של התימה (2-3 משפטים)",
+    "definition": "הגדרה אקדמית מפורטת (2-3 משפטים)",
     "codes": ["קוד 1", "קוד 2"],
     "quotes": [
       {{
@@ -400,14 +537,13 @@ def p_define_themes(themes, segments):
 
 
 def p_report(themes_defined, segments):
-    """דו"ח מחקרי מסכם"""
     return f"""
 אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke.
 
 כתוב דו"ח ממצאים מחקרי מקצועי.
 
 הדו"ח צריך לכלול:
-1. תקציר מנהלים (Executive Summary)
+1. תקציר מנהלים
 2. סקירת התימות המרכזיות
 3. ממצאים עיקריים לכל תימה
 4. קשרים בין התימות
@@ -443,7 +579,6 @@ def p_report(themes_defined, segments):
 
 
 def p_matrix(themes_defined, codes):
-    """מטריצת תימות מסכמת"""
     return f"""
 צור מטריצת תימות אקדמית מסכמת.
 
@@ -485,7 +620,7 @@ async def run_pipeline(job_id, transcript_raw, ctx, model, api_key):
         if not segments:
             raise Exception("לא נמצאו מקטעים בתמלול")
         
-        logger.info(f"Starting analysis with {len(segments)} segments")
+        logger.info(f"Starting analysis with {len(segments)} segments, model: {model}")
 
         # שלב 0: סינון ראשוני בצד שרת
         update_progress(job_id, 5)
@@ -619,6 +754,21 @@ async def status(job_id: str):
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
+
+
+@app.get("/models")
+async def get_models():
+    """מחזיר רשימת מודלים זמינים"""
+    return {
+        "models": [
+            {
+                "id": model_id,
+                "name": config["api_name"],
+                "provider": config["provider"]
+            }
+            for model_id, config in MODEL_CONFIG.items()
+        ]
+    }
 
 
 if __name__ == "__main__":
