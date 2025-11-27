@@ -4,7 +4,7 @@ import asyncio
 import re
 import logging
 import time
-from typing import Union, Optional, List, Dict
+from typing import Union, Optional
 
 from fastapi import FastAPI, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,26 +19,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Qualitative Analysis Agent - Braun & Clarke")
 
-# CORS middleware - must be added before routes
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-# Global exception handler
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    return Response(
-        content=json.dumps({"error": str(exc), "status": "error"}),
-        status_code=500,
-        media_type="application/json",
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
 
 # ============================================================
 # MODEL CONFIGURATIONS (נובמבר 2025)
@@ -52,7 +39,6 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 30,
         "retry_delay": 60,
-        "max_segments_per_chunk": 35,  # ~35 segments per API call
     },
     "gemini-pro": {
         "api_name": "gemini-1.5-pro",
@@ -62,7 +48,6 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 30,
         "retry_delay": 60,
-        "max_segments_per_chunk": 40,
     },
     "gpt": {
         "api_name": "gpt-4o",
@@ -72,7 +57,6 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 5,
         "retry_delay": 30,
-        "max_segments_per_chunk": 30,
     },
     "gpt-mini": {
         "api_name": "gpt-4o-mini",
@@ -82,7 +66,6 @@ MODEL_CONFIG = {
         "max_retries": 5,
         "base_delay": 3,
         "retry_delay": 20,
-        "max_segments_per_chunk": 35,
     },
     "claude": {
         "api_name": "claude-sonnet-4-20250514",
@@ -92,7 +75,6 @@ MODEL_CONFIG = {
         "max_retries": 4,
         "base_delay": 5,
         "retry_delay": 30,
-        "max_segments_per_chunk": 35,
     },
     "claude-haiku": {
         "api_name": "claude-haiku-4-20250514",
@@ -102,7 +84,6 @@ MODEL_CONFIG = {
         "max_retries": 4,
         "base_delay": 3,
         "retry_delay": 20,
-        "max_segments_per_chunk": 40,
     },
 }
 
@@ -113,7 +94,6 @@ JOBS = {}
 
 
 def create_job(job_id):
-    """יוצר job חדש או מאפס job קיים"""
     JOBS[job_id] = {
         "status": "running",
         "progress": 0,
@@ -125,31 +105,26 @@ def create_job(job_id):
 
 
 def update_progress(job_id, v, step_info=""):
-    if job_id not in JOBS:
-        create_job(job_id)
-    JOBS[job_id]["progress"] = int(v)
-    JOBS[job_id]["step_info"] = step_info
-    JOBS[job_id]["wait_until"] = None
+    if job_id in JOBS:
+        JOBS[job_id]["progress"] = int(v)
+        JOBS[job_id]["step_info"] = step_info
+        JOBS[job_id]["wait_until"] = None
 
 
 def set_waiting(job_id, seconds):
-    if job_id not in JOBS:
-        create_job(job_id)
-    JOBS[job_id]["status"] = "waiting"
-    JOBS[job_id]["wait_until"] = time.time() + seconds
-    JOBS[job_id]["step_info"] = f"ממתין {seconds} שניות בגלל הגבלת קריאות..."
+    if job_id in JOBS:
+        JOBS[job_id]["status"] = "waiting"
+        JOBS[job_id]["wait_until"] = time.time() + seconds
+        JOBS[job_id]["step_info"] = f"ממתין {seconds} שניות בגלל הגבלת קריאות..."
 
 
 def set_running(job_id):
-    if job_id not in JOBS:
-        create_job(job_id)
-    JOBS[job_id]["status"] = "running"
-    JOBS[job_id]["wait_until"] = None
+    if job_id in JOBS:
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["wait_until"] = None
 
 
 def set_result(job_id, r):
-    if job_id not in JOBS:
-        create_job(job_id)
     JOBS[job_id]["status"] = "done"
     JOBS[job_id]["progress"] = 100
     JOBS[job_id]["result"] = r
@@ -157,15 +132,13 @@ def set_result(job_id, r):
 
 
 def set_error(job_id, err):
-    if job_id not in JOBS:
-        create_job(job_id)
     JOBS[job_id]["status"] = "error"
     JOBS[job_id]["error"] = str(err)
     JOBS[job_id]["wait_until"] = None
 
 
 # ============================================================
-# REQUEST MODELS
+# REQUEST MODEL
 # ============================================================
 class ResearchContext(BaseModel):
     research_question: str = ""
@@ -220,26 +193,6 @@ def extract_json(raw_text: str):
         except:
             pass
         return None
-
-
-# ============================================================
-# TIME FORMATTING
-# ============================================================
-def format_timestamp(seconds: float) -> str:
-    """המרת שניות לפורמט MM:SS או HH:MM:SS"""
-    if seconds is None:
-        return ""
-    try:
-        seconds = float(seconds)
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
-    except:
-        return ""
 
 
 # ============================================================
@@ -403,62 +356,27 @@ async def model_call(prompt: str, model: str, api_key: str, job_id: str) -> str:
 
 
 # ============================================================
-# TRANSCRIPT EXTRACTION - תומך במספר פורמטים
+# TRANSCRIPT EXTRACTION & FILTERING
 # ============================================================
-def extract_transcript(raw) -> List[Dict]:
-    """
-    מחלץ מקטעי תמלול מפורמטים שונים:
-    - Tamleli Pro format: segments + versionHistory
-    - Simple format: list of segments
-    - Legacy format: versions array
-    """
-    segments = []
-    
+def extract_transcript(raw):
     if isinstance(raw, list):
-        segments = raw
-    elif isinstance(raw, dict):
-        # Tamleli Pro format - use main segments (latest version)
+        return raw
+    if isinstance(raw, dict):
+        if "versions" in raw:
+            return raw["versions"][-1].get("segments", [])
         if "segments" in raw:
-            segments = raw["segments"]
-        # Legacy format with versions
-        elif "versions" in raw:
-            versions = raw["versions"]
-            if versions:
-                # Get latest version
-                latest = sorted(versions, key=lambda v: v.get("saved_at", ""), reverse=True)[0]
-                segments = latest.get("segments", latest.get("segments_snapshot", []))
-        # versionHistory format
-        elif "versionHistory" in raw:
-            vh = raw["versionHistory"]
-            if vh:
-                latest = sorted(vh, key=lambda v: v.get("saved_at", ""), reverse=True)[0]
-                segments = latest.get("segments_snapshot", [])
-        # Utterances format
-        elif "utterances" in raw:
-            segments = raw["utterances"]
-    
-    # Ensure each segment has required fields
-    processed = []
-    for i, seg in enumerate(segments):
-        processed.append({
-            "index": i,
-            "speaker": seg.get("speaker", f"דובר {i+1}"),
-            "text": seg.get("text", ""),
-            "start": seg.get("start"),
-            "end": seg.get("end"),
-        })
-    
-    return processed
+            return raw["segments"]
+        if "utterances" in raw:
+            return raw["utterances"]
+    return []
 
 
 def filter_intro_segments(segments: list) -> list:
-    """מסנן מקטעי פתיחה/סגירה לא רלוונטיים"""
     intro_patterns = [
         r'שלום.*שמי', r'היי.*קוראים לי', r'אני.*המראיין',
         r'תודה שהסכמת', r'נתחיל.*הראיון', r'לפני שנתחיל',
         r'אני מקליט', r'בוא נתחיל', r'תספר.*על עצמך',
         r'תודה רבה על.*הראיון', r'זהו.*סיימנו', r'נסיים כאן',
-        r'כל השמות.*בדויים', r'במסגרת.*התואר',
     ]
     
     filtered = []
@@ -478,53 +396,36 @@ def filter_intro_segments(segments: list) -> list:
     return filtered
 
 
-def chunk_segments(segments: List[Dict], max_per_chunk: int) -> List[List[Dict]]:
-    """
-    מחלק את התמלול לחלקים עם הקשר חופף
-    כל חלק מקבל 2-3 מקטעים מהחלק הקודם לשמירת הקשר
-    """
-    if len(segments) <= max_per_chunk:
-        return [segments]
-    
-    chunks = []
-    overlap = 3  # מקטעי חפיפה בין chunks
-    
-    i = 0
-    while i < len(segments):
-        end = min(i + max_per_chunk, len(segments))
-        chunk = segments[i:end]
-        chunks.append(chunk)
-        i = end - overlap  # חפיפה
-        if i < 0:
-            i = end
-    
-    return chunks
-
-
 # ============================================================
-# PROMPTS WITH QUOTE ENFORCEMENT
+# PROMPTS WITH RESEARCH CONTEXT
 # ============================================================
 
 def format_research_context(ctx: dict) -> str:
+    """מעצב את הקשר המחקר לתוך הפרומפט"""
     parts = []
+    
     if ctx.get("research_question"):
         parts.append(f"שאלת המחקר: {ctx['research_question']}")
+    
     if ctx.get("study_context"):
         parts.append(f"הקשר המחקר: {ctx['study_context']}")
+    
     if ctx.get("additional_notes"):
         parts.append(f"הערות נוספות: {ctx['additional_notes']}")
-    return "\n".join(parts) if parts else ""
+    
+    if parts:
+        return "\n".join(parts)
+    return ""
 
 
-def p_coding_and_themes(segments: List[Dict], research_ctx: dict, chunk_info: str = ""):
-    """פרומפט לקידוד - עם אכיפת ציטוטים וחותמות זמן"""
+def p_coding_and_themes(segments, research_ctx: dict):
+    """פרומפט משולב: סינון + קידוד + תימות ראשוניות - עם הקשר מחקר"""
     
     context_section = format_research_context(research_ctx)
     
-    # Format segments with timestamps
     text = "\n\n".join([
-        f"[מקטע {s.get('index', i)+1}] [{format_timestamp(s.get('start'))} - {format_timestamp(s.get('end'))}] {s.get('speaker', 'דובר')}:\n\"{s.get('text', '')}\""
-        for i, s in enumerate(segments)
+        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')}\""
+        for i, s in enumerate(segments[:50])
     ])
     
     return f"""
@@ -533,26 +434,19 @@ def p_coding_and_themes(segments: List[Dict], research_ctx: dict, chunk_info: st
 {"=" * 50}
 הקשר המחקר:
 {context_section if context_section else "לא סופק הקשר ספציפי - בצע ניתוח כללי"}
-{chunk_info}
 {"=" * 50}
 
-קיבלת תמלול ראיון. בצע ניתוח מקיף תוך התמקדות בשאלת המחקר.
+קיבלת תמלול ראיון. בצע ניתוח מקיף תוך התמקדות בשאלת המחקר והקשר שסופק.
 
-## הנחיות קריטיות:
+## הנחיות חשובות:
 
-### 1. קידוד פתוח
-- צור קודים סמנטיים (2-5 מילים) לכל מקטע משמעותי
-- קודים צריכים להיות בעברית ותמציתיים
+1. **התמקד בתוכן הרלוונטי לשאלת המחקר** - התעלם ממידע דמוגרפי, הצגות עצמיות, ושיחת חולין שאינם קשורים ישירות לנושא.
 
-### 2. ⚠️ חובה: ציטוטים לכל קוד!
-- **לכל קוד חייבים להיות לפחות 2-3 ציטוטים מהתמלול**
-- ציטוטים צריכים להיות **מדויקים** - העתק את הטקסט המקורי
-- כל ציטוט חייב לכלול **חותמת זמן** (start, end)
-- ניתוח ללא ציטוטים הוא ניתוח לא תקין!
+2. **קידוד פתוח (Initial Coding)** - צור קודים סמנטיים (2-5 מילים) שמתארים את התוכן ביחס לשאלת המחקר.
 
-### 3. תימות ראשוניות
-- קבץ קודים דומים ל-3-6 תימות
-- כל תימה צריכה שם ממצה ותיאור קצר
+3. **תימות ראשוניות** - קבץ קודים לתימות שעונות על שאלת המחקר (3-6 תימות).
+
+4. **ציטוטים** - לכל קוד, שמור את הציטוטים הרלוונטיים מהתמלול. זה קריטי!
 
 ## התמלול:
 {text}
@@ -561,33 +455,24 @@ def p_coding_and_themes(segments: List[Dict], research_ctx: dict, chunk_info: st
 {{
   "intro_info": {{
     "participant_description": "תיאור קצר של המרואיין (אם יש)",
-    "interview_context": "הקשר הראיון",
-    "excluded_content": "תוכן שהושמט"
+    "interview_context": "הקשר הראיון (אם רלוונטי)",
+    "excluded_content": "סוגי תוכן שהושמטו מהניתוח"
   }},
   "codes": [
     {{
       "segment_index": 1,
       "text": "הטקסט המלא של המקטע",
-      "start": 0.0,
-      "end": 10.5,
-      "speaker": "דובר",
       "codes": ["קוד 1", "קוד 2"],
-      "quotes": [
-        {{
-          "text": "ציטוט מדויק מהמקטע",
-          "start": 2.5,
-          "end": 8.0,
-          "timestamp": "00:02"
-        }}
-      ]
+      "quotes": ["ציטוט מדויק 1", "ציטוט מדויק 2"],
+      "speaker": "דובר"
     }}
   ],
   "initial_themes": [
     {{
-      "theme": "שם התימה המלא",
-      "description": "תיאור מפורט",
-      "codes": ["קוד 1", "קוד 2"],
-      "relevance_to_research": "קשר לשאלת המחקר"
+      "theme": "שם התימה",
+      "description": "תיאור קצר",
+      "codes": ["קוד 1", "קוד 2", "קוד 3"],
+      "relevance_to_research": "כיצד התימה עונה על שאלת המחקר"
     }}
   ]
 }}
@@ -595,23 +480,15 @@ def p_coding_and_themes(segments: List[Dict], research_ctx: dict, chunk_info: st
 
 
 def p_define_and_report(themes, codes, segments, research_ctx: dict):
-    """פרומפט להגדרת תימות ודו"ח - עם אכיפת ציטוטים"""
+    """פרומפט משולב: הגדרת תימות + דו"ח + מטריצה - עם הקשר מחקר"""
     
     context_section = format_research_context(research_ctx)
     participant_info = research_ctx.get("participant_info", "")
     
-    # Prepare quotes from coded segments
-    all_quotes = []
-    for c in codes:
-        for q in c.get("quotes", []):
-            all_quotes.append({
-                "text": q.get("text", ""),
-                "start": q.get("start"),
-                "end": q.get("end"),
-                "timestamp": q.get("timestamp", format_timestamp(q.get("start"))),
-                "speaker": c.get("speaker", ""),
-                "code": c.get("codes", [])[0] if c.get("codes") else ""
-            })
+    quotes_text = "\n".join([
+        f"[{i+1}] {s.get('speaker', 'דובר')}: \"{s.get('text', '')[:300]}\""
+        for i, s in enumerate(segments[:30])
+    ])
     
     return f"""
 אתה מנתח מחקר איכותני מומחה בשיטת Braun & Clarke (2006).
@@ -624,45 +501,48 @@ def p_define_and_report(themes, codes, segments, research_ctx: dict):
 {participant_info if participant_info else "לא סופק מידע"}
 {"=" * 50}
 
-## תימות ראשוניות לעיבוד:
+בצע ניתוח סופי מקיף שעונה על שאלת המחקר:
+
+## תימות לעיבוד:
 {json.dumps(themes, ensure_ascii=False, indent=2)}
 
-## קודים וציטוטים שזוהו:
-{json.dumps(codes[:40], ensure_ascii=False, indent=2)}
+## קודים שזוהו (כולל ציטוטים):
+{json.dumps(codes[:30], ensure_ascii=False, indent=2)}
+
+## מקטעים נוספים מהתמלול:
+{quotes_text}
 
 ## משימות:
 
 ### 1. הגדר תימות סופיות
 לכל תימה:
-- שם אקדמי מלא וממצה (לא לקצר!)
+- שם אקדמי ממצה
 - הגדרה מפורטת (2-3 משפטים)
-- רשימת קודים משויכים (מופרדים בפסיקים)
+- קודים משויכים עם ציטוטים לכל קוד (חשוב מאוד!)
+- משמעות ביחס לשאלת המחקר
 
-### 2. ⚠️ חובה: ציטוטים עשירים!
-- **כל קוד חייב לכלול לפחות 2-4 ציטוטים**
-- כל ציטוט עם חותמת זמן (timestamp)
-- העתק ציטוטים **מדויקים** מהתמלול
-- ניתוח עשיר בציטוטים = ניתוח איכותי!
-
-### 3. דו"ח ממצאים
-- פסקת מבוא עם רקע על המרואיין
+### 2. כתוב דו"ח ממצאים
+- פסקת מבוא עם פרטי רקע על המרואיין/מחקר
 - תקציר מנהלים שעונה על שאלת המחקר
+- סקירת תימות והשלכות
+
+### 3. מטריצת קודים-ציטוטים
+לכל תימה וקוד - רשום את כל הציטוטים הרלוונטיים!
 
 ## החזר JSON בלבד:
 {{
-  "intro_paragraph": "פסקת מבוא עם רקע על המרואיין והקשר הראיון",
+  "intro_paragraph": "פסקת מבוא עם רקע על המרואיין, הקשר הראיון, ומידע רלוונטי שאינו חלק מהניתוח התמטי עצמו",
   "themes_defined": [
     {{
-      "theme": "שם התימה המלא והאקדמי",
+      "theme": "שם התימה האקדמי",
       "definition": "הגדרה מפורטת (2-3 משפטים)",
       "relevance_to_research": "כיצד התימה עונה על שאלת המחקר",
       "codes_with_quotes": [
         {{
           "code": "שם הקוד",
           "quotes": [
-            {{"text": "ציטוט מדויק 1", "speaker": "מרואיין", "timestamp": "05:23", "start": 323.0, "end": 330.0}},
-            {{"text": "ציטוט מדויק 2", "speaker": "מרואיין", "timestamp": "12:45", "start": 765.0, "end": 772.0}},
-            {{"text": "ציטוט מדויק 3", "speaker": "מרואיין", "timestamp": "18:30", "start": 1110.0, "end": 1118.0}}
+            {{"text": "ציטוט מדויק 1", "speaker": "מרואיין"}},
+            {{"text": "ציטוט מדויק 2", "speaker": "מרואיין"}}
           ]
         }}
       ],
@@ -670,14 +550,14 @@ def p_define_and_report(themes, codes, segments, research_ctx: dict):
     }}
   ],
   "report": {{
-    "executive_summary": "תקציר מנהלים שעונה על שאלת המחקר (4-5 משפטים)",
+    "executive_summary": "תקציר מנהלים שעונה ישירות על שאלת המחקר (4-5 משפטים)",
     "methodology_note": "הערה מתודולוגית",
     "themes_overview": [
       {{
-        "theme": "שם מלא",
-        "key_findings": "ממצאים עיקריים",
+        "theme": "שם",
+        "key_findings": "ממצאים עיקריים ביחס לשאלת המחקר",
         "prevalence": "גבוהה/בינונית/נמוכה",
-        "quotes_count": 8
+        "significance": "משמעות"
       }}
     ],
     "theme_relationships": "קשרים בין תימות",
@@ -690,14 +570,12 @@ def p_define_and_report(themes, codes, segments, research_ctx: dict):
   }},
   "matrix": [
     {{
-      "theme": "שם התימה המלא",
-      "definition": "הגדרה מלאה",
+      "theme": "שם התימה",
+      "definition": "הגדרה",
       "codes": [
         {{
           "code": "שם הקוד",
-          "quotes": [
-            {{"text": "ציטוט", "timestamp": "05:23", "start": 323.0, "end": 330.0, "speaker": "מרואיין"}}
-          ]
+          "quotes": ["ציטוט 1", "ציטוט 2", "ציטוט 3"]
         }}
       ],
       "prevalence": "גבוהה",
@@ -709,14 +587,15 @@ def p_define_and_report(themes, codes, segments, research_ctx: dict):
 
 
 # ============================================================
-# PIPELINE WITH CHUNKING
+# OPTIMIZED PIPELINE
 # ============================================================
 async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
     try:
+        # Get model display name
         model_config = MODEL_CONFIG.get(model, MODEL_CONFIG["gemini"])
         model_display_name = model_config.get("display_name", model)
-        max_segments = model_config.get("max_segments_per_chunk", 35)
         
+        # Normalize research context
         if isinstance(research_ctx, dict):
             ctx = research_ctx
         else:
@@ -728,116 +607,89 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
         if not segments:
             raise Exception("לא נמצאו מקטעים בתמלול")
         
-        original_count = len(segments)
-        logger.info(f"Loaded {original_count} segments")
+        logger.info(f"Starting analysis with {len(segments)} segments, model: {model}")
+        logger.info(f"Research context: {ctx.get('research_question', 'None')[:100]}")
 
         update_progress(job_id, 10, "מסנן תוכן...")
         segments = filter_intro_segments(segments)
-        filtered_count = len(segments)
-        logger.info(f"After filtering: {filtered_count} segments")
+        logger.info(f"After filtering: {len(segments)} segments")
 
-        if filtered_count == 0:
+        if len(segments) == 0:
             raise Exception("לא נשאר תוכן לניתוח לאחר סינון")
 
-        # Check if chunking is needed
-        chunks = chunk_segments(segments, max_segments)
-        num_chunks = len(chunks)
-        logger.info(f"Split into {num_chunks} chunks (max {max_segments} segments each)")
-
-        all_codes = []
-        all_themes = []
-
-        # ========== שלב 1: קידוד (עם חלוקה לחלקים אם צריך) ==========
-        for chunk_idx, chunk in enumerate(chunks):
-            chunk_info = ""
-            if num_chunks > 1:
-                chunk_info = f"\n[חלק {chunk_idx + 1} מתוך {num_chunks}]"
-                if chunk_idx > 0:
-                    chunk_info += "\n(המשך מחלק קודם - שמור על קוהרנטיות)"
-            
-            progress = 15 + (chunk_idx / num_chunks) * 30
-            update_progress(job_id, progress, f"שלב 1: קידוד (חלק {chunk_idx + 1}/{num_chunks})...")
-            
-            raw1 = await model_call(
-                p_coding_and_themes(chunk, ctx, chunk_info),
-                model, api_key, job_id
-            )
-            result1 = extract_json(raw1)
-            
-            if result1:
-                chunk_codes = result1.get("codes", [])
-                chunk_themes = result1.get("initial_themes", [])
-                all_codes.extend(chunk_codes)
-                
-                # Merge themes intelligently
-                for new_theme in chunk_themes:
-                    existing = next((t for t in all_themes if t.get("theme") == new_theme.get("theme")), None)
-                    if existing:
-                        existing["codes"] = list(set(existing.get("codes", []) + new_theme.get("codes", [])))
-                    else:
-                        all_themes.append(new_theme)
+        # ========== קריאה 1 ==========
+        update_progress(job_id, 20, "שלב 1/2: קידוד וזיהוי תימות ראשוניות...")
+        logger.info("Step 1: Coding and Initial Themes")
         
-        if not all_codes:
-            logger.warning("No codes found, creating defaults")
-            all_codes = [{
-                "segment_index": i,
-                "text": s.get("text", "")[:200],
-                "start": s.get("start"),
-                "end": s.get("end"),
-                "codes": ["קוד כללי"],
-                "quotes": [{"text": s.get("text", "")[:100], "start": s.get("start"), "end": s.get("end"), "timestamp": format_timestamp(s.get("start"))}],
-                "speaker": s.get("speaker", "")
-            } for i, s in enumerate(segments[:20])]
+        raw1 = await model_call(p_coding_and_themes(segments, ctx), model, api_key, job_id)
+        result1 = extract_json(raw1)
         
-        if not all_themes:
-            all_themes = [{"theme": "תימה כללית", "description": "תימה שזוהתה", "codes": ["קוד כללי"]}]
+        if not result1:
+            logger.error("Failed to parse step 1 result")
+            result1 = {
+                "intro_info": {},
+                "codes": [{"segment_index": i+1, "text": s.get("text", "")[:100], "codes": ["קוד כללי"], "quotes": [s.get("text", "")[:100]], "speaker": s.get("speaker", "")} 
+                         for i, s in enumerate(segments[:20])],
+                "initial_themes": [{"theme": "תימה כללית", "description": "תימה שזוהתה בניתוח", "codes": ["קוד כללי"], "relevance_to_research": ""}]
+            }
         
-        logger.info(f"Total: {len(all_codes)} coded segments, {len(all_themes)} themes")
+        intro_info = result1.get("intro_info", {})
+        codes = result1.get("codes", [])
+        themes_initial = result1.get("initial_themes", [])
+        
+        logger.info(f"Found {len(codes)} coded segments, {len(themes_initial)} initial themes")
         update_progress(job_id, 50, "שלב 1 הושלם...")
 
-        # ========== שלב 2: הגדרה ודו"ח ==========
-        update_progress(job_id, 55, "שלב 2: הגדרת תימות ודו\"ח...")
+        # ========== קריאה 2 ==========
+        update_progress(job_id, 55, "שלב 2/2: הגדרת תימות ודו\"ח...")
+        logger.info("Step 2: Define, Report and Matrix")
         
-        raw2 = await model_call(
-            p_define_and_report(all_themes, all_codes, segments, ctx),
-            model, api_key, job_id
-        )
+        raw2 = await model_call(p_define_and_report(themes_initial, codes, segments, ctx), model, api_key, job_id)
         result2 = extract_json(raw2)
         
         if not result2:
-            logger.error("Failed to parse step 2, creating defaults")
-            result2 = create_default_result(all_themes, all_codes)
+            logger.error("Failed to parse step 2 result")
+            result2 = {
+                "intro_paragraph": "",
+                "themes_defined": [
+                    {
+                        "theme": t.get("theme", "תימה"),
+                        "definition": t.get("description", ""),
+                        "relevance_to_research": t.get("relevance_to_research", ""),
+                        "codes_with_quotes": [{"code": c, "quotes": []} for c in t.get("codes", [])],
+                        "theoretical_significance": ""
+                    }
+                    for t in themes_initial
+                ],
+                "report": {
+                    "executive_summary": f"נותחו {len(segments)} מקטעים וזוהו {len(themes_initial)} תימות.",
+                    "methodology_note": "ניתוח תמטי לפי Braun & Clarke (2006)",
+                    "themes_overview": [],
+                    "theme_relationships": "",
+                    "implications": {"theoretical": "", "practical": ""},
+                    "limitations": "",
+                    "future_research": ""
+                },
+                "matrix": []
+            }
 
         update_progress(job_id, 95, "מסכם תוצאות...")
 
-        # Build final result
         themes_defined = result2.get("themes_defined", [])
         report = result2.get("report", {})
         matrix = result2.get("matrix", [])
         intro_paragraph = result2.get("intro_paragraph", "")
         
-        # Ensure quotes exist
-        themes_defined = ensure_quotes_in_themes(themes_defined, all_codes)
-        matrix = ensure_quotes_in_matrix(matrix, themes_defined)
-        
         if not report.get("executive_summary"):
-            report["executive_summary"] = f"ניתוח תמטי של {filtered_count} מקטעים העלה {len(themes_defined)} תימות מרכזיות."
-        
-        # Count quotes
-        total_quotes = sum(
-            sum(len(cq.get("quotes", [])) for cq in t.get("codes_with_quotes", []))
-            for t in themes_defined
-        )
+            report["executive_summary"] = f"ניתוח תמטי של {len(segments)} מקטעים העלה {len(themes_defined)} תימות מרכזיות."
         
         stats = {
-            "total_segments": filtered_count,
-            "original_segments": original_count,
-            "total_codes": len(all_codes),
+            "total_segments": len(segments),
+            "total_codes": sum(len(c.get("codes", [])) for c in codes),
             "total_themes": len(themes_defined),
-            "total_quotes": total_quotes,
             "analysis_model": model,
             "model_display_name": model_display_name,
-            "chunks_processed": num_chunks,
+            "api_calls": 2,
             "analysis_date": time.strftime("%Y-%m-%d %H:%M")
         }
         
@@ -847,9 +699,10 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
             "statistics": stats,
             "research_context": ctx,
             "intro_paragraph": intro_paragraph,
+            "intro_info": intro_info,
             "clean_transcript": segments,
-            "codes": all_codes,
-            "themes_initial": all_themes,
+            "codes": codes,
+            "themes_initial": themes_initial,
             "themes_defined": themes_defined,
             "report": report,
             "matrix": matrix
@@ -860,202 +713,64 @@ async def run_pipeline(job_id, transcript_raw, research_ctx, model, api_key):
         raise
 
 
-def create_default_result(themes, codes):
-    """יוצר תוצאת ברירת מחדל אם הפרסינג נכשל"""
-    return {
-        "intro_paragraph": "",
-        "themes_defined": [
-            {
-                "theme": t.get("theme", "תימה"),
-                "definition": t.get("description", ""),
-                "relevance_to_research": "",
-                "codes_with_quotes": [
-                    {"code": c, "quotes": []}
-                    for c in t.get("codes", [])
-                ],
-                "theoretical_significance": ""
-            }
-            for t in themes
-        ],
-        "report": {
-            "executive_summary": f"זוהו {len(themes)} תימות מרכזיות.",
-            "methodology_note": "ניתוח תמטי לפי Braun & Clarke (2006)",
-            "themes_overview": [],
-            "theme_relationships": "",
-            "implications": {"theoretical": "", "practical": ""},
-            "limitations": "",
-            "future_research": ""
-        },
-        "matrix": []
-    }
-
-
-def ensure_quotes_in_themes(themes_defined, all_codes):
-    """מוודא שיש ציטוטים לכל קוד בתימות"""
-    # Build a map of code -> quotes from all_codes
-    code_quotes_map = {}
-    for c in all_codes:
-        for code_name in c.get("codes", []):
-            if code_name not in code_quotes_map:
-                code_quotes_map[code_name] = []
-            # Add quotes from this segment
-            for q in c.get("quotes", []):
-                code_quotes_map[code_name].append({
-                    "text": q.get("text", c.get("text", "")[:100]),
-                    "speaker": c.get("speaker", ""),
-                    "timestamp": q.get("timestamp", format_timestamp(c.get("start"))),
-                    "start": q.get("start", c.get("start")),
-                    "end": q.get("end", c.get("end"))
-                })
-            # If no quotes, use segment text
-            if not c.get("quotes"):
-                code_quotes_map[code_name].append({
-                    "text": c.get("text", "")[:150],
-                    "speaker": c.get("speaker", ""),
-                    "timestamp": format_timestamp(c.get("start")),
-                    "start": c.get("start"),
-                    "end": c.get("end")
-                })
-    
-    # Ensure themes have quotes
-    for theme in themes_defined:
-        codes_with_quotes = theme.get("codes_with_quotes", [])
-        if not codes_with_quotes:
-            # Create from theme's codes list
-            theme["codes_with_quotes"] = [
-                {"code": code, "quotes": code_quotes_map.get(code, [])}
-                for code in theme.get("codes", [])
-            ]
-        else:
-            # Ensure each code has quotes
-            for cq in codes_with_quotes:
-                if not cq.get("quotes"):
-                    cq["quotes"] = code_quotes_map.get(cq.get("code"), [])
-    
-    return themes_defined
-
-
-def ensure_quotes_in_matrix(matrix, themes_defined):
-    """מוודא שיש ציטוטים במטריצה"""
-    if not matrix:
-        # Build from themes_defined
-        matrix = []
-        for theme in themes_defined:
-            matrix.append({
-                "theme": theme.get("theme", ""),
-                "definition": theme.get("definition", ""),
-                "codes": theme.get("codes_with_quotes", []),
-                "prevalence": "בינונית",
-                "key_insight": theme.get("relevance_to_research", "")
-            })
-    else:
-        # Ensure codes have quotes
-        theme_map = {t.get("theme"): t for t in themes_defined}
-        for m in matrix:
-            if not m.get("codes") or all(not c.get("quotes") for c in m.get("codes", [])):
-                theme = theme_map.get(m.get("theme"))
-                if theme:
-                    m["codes"] = theme.get("codes_with_quotes", [])
-    
-    return matrix
-
-
 # ============================================================
 # BACKGROUND RUNNER
 # ============================================================
 async def background_run(job_id, transcript, ctx, model, api_key):
     logger.info(f"Background task started for job {job_id}")
     try:
-        # Validate inputs
-        if not transcript:
-            raise Exception("תמלול חסר")
-        if not api_key:
-            raise Exception("API Key חסר")
-        if not model:
-            model = "gemini"
-        
         result = await run_pipeline(job_id, transcript, ctx, model, api_key)
         set_result(job_id, result)
-        logger.info(f"Job {job_id} completed successfully")
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+        logger.error(f"Job {job_id} failed: {e}")
         set_error(job_id, str(e))
 
 
 # ============================================================
 # API ENDPOINTS
 # ============================================================
+
+
 @app.post("/agent/analyze")
 async def analyze(req: AnalysisRequest):
-    try:
-        # Validate request
-        if not req.transcript:
-            return {"error": "תמלול חסר", "status": "error"}
-        
-        if not req.api_key:
-            return {"error": "API Key חסר", "status": "error"}
-        
-        job_id = str(uuid.uuid4())
-        create_job(job_id)
-        
-        ctx = req.research_context
-        if hasattr(ctx, 'dict'):
-            ctx = ctx.dict()
-        elif not isinstance(ctx, dict):
-            ctx = {}
-        
-        asyncio.create_task(
-            background_run(job_id, req.transcript, ctx, req.model, req.api_key)
-        )
-        
-        return {"job_id": job_id, "status": "running"}
-    except Exception as e:
-        logger.error(f"Error in analyze endpoint: {e}")
-        return {"error": str(e), "status": "error"}
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+    
+    # Convert research_context to dict if needed
+    ctx = req.research_context
+    if hasattr(ctx, 'dict'):
+        ctx = ctx.dict()
+    elif not isinstance(ctx, dict):
+        ctx = {}
+    
+    asyncio.create_task(
+        background_run(job_id, req.transcript, ctx, req.model, req.api_key)
+    )
+    
+    return {"job_id": job_id, "status": "running"}
 
 
 @app.get("/agent/status/{job_id}")
 async def status(job_id: str):
-    try:
-        if not job_id:
-            return {"error": "job_id is required", "status": "error"}
-        
-        job = JOBS.get(job_id, {"error": "not found", "status": "error"})
-        
-        if job.get("wait_until"):
-            remaining = max(0, int(job["wait_until"] - time.time()))
-            job["wait_remaining"] = remaining
-        else:
-            job["wait_remaining"] = 0
-        
-        # Ensure response has CORS headers
-        return job
-    except Exception as e:
-        logger.error(f"Error getting status for {job_id}: {e}", exc_info=True)
-        return {"error": str(e), "status": "error"}
+    job = JOBS.get(job_id, {"error": "not found"})
+    
+    if job.get("wait_until"):
+        remaining = max(0, int(job["wait_until"] - time.time()))
+        job["wait_remaining"] = remaining
+    else:
+        job["wait_remaining"] = 0
+    
+    return job
 
 
 @app.get("/ping")
 async def ping():
-    """Health check endpoint"""
-    try:
-        return {"status": "ok", "timestamp": time.time()}
-    except Exception as e:
-        logger.error(f"Error in ping: {e}")
-        return {"status": "error", "error": str(e)}
+    return {"status": "ok"}
 
 @app.head("/ping")
 async def ping_head():
-    """Health check endpoint for UptimeRobot"""
-    try:
-        return Response(
-            status_code=200,
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
-    except Exception as e:
-        logger.error(f"Error in ping_head: {e}")
-        return Response(status_code=500)
-
+    # UptimeRobot שולח בקשת HEAD – מחזירים 200 בלי body
+    return Response(status_code=200)
 
 
 @app.get("/models")
