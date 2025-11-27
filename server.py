@@ -729,6 +729,13 @@ async def background_run(job_id, transcript, ctx, model, api_key):
 # ============================================================
 # API ENDPOINTS
 # ============================================================
+@app.head("/ping")
+async def ping_head():
+    return Response(status_code=200)
+
+
+
+
 @app.post("/agent/analyze")
 async def analyze(req: AnalysisRequest):
     job_id = str(uuid.uuid4())
