@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Union, Optional
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -729,11 +729,6 @@ async def background_run(job_id, transcript, ctx, model, api_key):
 # ============================================================
 # API ENDPOINTS
 # ============================================================
-@app.head("/ping")
-async def ping_head():
-    return Response(status_code=200)
-
-
 
 
 @app.post("/agent/analyze")
@@ -771,6 +766,11 @@ async def status(job_id: str):
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
+
+@app.head("/ping")
+async def ping_head():
+    # UptimeRobot שולח בקשת HEAD – מחזירים 200 בלי body
+    return Response(status_code=200)
 
 
 @app.get("/models")
